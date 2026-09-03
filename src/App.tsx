@@ -4,6 +4,7 @@ import { TopBar } from './components/Navigation/TopBar';
 import { BottomNav } from './components/Navigation/BottomNav';
 import { AuthView } from './components/Auth/AuthView';
 import { CreateOrJoinHomeModal } from './components/HomeManagement/CreateOrJoinHomeModal';
+import { HomeSettingsModal } from './components/HomeManagement/HomeSettingsModal';
 import { HomeFeedView } from './components/Feed/HomeFeedView';
 import { ChatView } from './components/Chat/ChatView';
 import { AskHomelyView } from './components/AskHomely/AskHomelyView';
@@ -16,8 +17,17 @@ import { Heart, Sparkles } from 'lucide-react';
 const MainLayout: React.FC = () => {
   const { user, loading, homes, activeHome } = useAuth();
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
+  const [familySubTab, setFamilySubTab] = useState<'members' | 'events' | 'memories' | 'vault'>('members');
   const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
   const [isCreateJoinModalOpen, setIsCreateJoinModalOpen] = useState(false);
+  const [isHomeSettingsOpen, setIsHomeSettingsOpen] = useState(false);
+
+  const handleNavigate = (tab: ActiveTab, subTab?: string) => {
+    setActiveTab(tab);
+    if (tab === 'family' && subTab) {
+      setFamilySubTab(subTab as 'members' | 'events' | 'memories' | 'vault');
+    }
+  };
 
   if (loading) {
     return (
@@ -51,6 +61,7 @@ const MainLayout: React.FC = () => {
       <TopBar
         onOpenNotifications={() => setIsNotificationsOpen(true)}
         onOpenCreateJoinModal={() => setIsCreateJoinModalOpen(true)}
+        onOpenHomeSettings={() => setIsHomeSettingsOpen(true)}
       />
 
       {/* Main Content Area */}
@@ -76,10 +87,10 @@ const MainLayout: React.FC = () => {
           </div>
         ) : (
           <>
-            {activeTab === 'home' && <HomeFeedView />}
+            {activeTab === 'home' && <HomeFeedView onNavigate={handleNavigate} />}
             {activeTab === 'chat' && <ChatView />}
             {activeTab === 'ask' && <AskHomelyView />}
-            {activeTab === 'family' && <FamilyView />}
+            {activeTab === 'family' && <FamilyView initialSubTab={familySubTab} />}
             {activeTab === 'profile' && (
               <ProfileView onOpenCreateJoinModal={() => setIsCreateJoinModalOpen(true)} />
             )}
@@ -99,6 +110,7 @@ const MainLayout: React.FC = () => {
       <NotificationsDrawer
         isOpen={isNotificationsOpen}
         onClose={() => setIsNotificationsOpen(false)}
+        onNavigate={handleNavigate}
       />
 
       {/* Create or Join Home Modal */}
@@ -106,6 +118,12 @@ const MainLayout: React.FC = () => {
         isOpen={isCreateJoinModalOpen || hasNoHome}
         onClose={() => setIsCreateJoinModalOpen(false)}
         required={hasNoHome}
+      />
+
+      {/* Home Settings & Customization Modal */}
+      <HomeSettingsModal
+        isOpen={isHomeSettingsOpen}
+        onClose={() => setIsHomeSettingsOpen(false)}
       />
     </div>
   );

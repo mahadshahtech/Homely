@@ -1,15 +1,17 @@
 import React, { useState } from 'react';
-import { ChevronDown, Plus, Copy, Check, Bell, Moon, Sun, Shield, LogOut } from 'lucide-react';
+import { ChevronDown, Plus, Copy, Check, Bell, Moon, Sun, Shield, LogOut, Settings } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 
 interface TopBarProps {
   onOpenNotifications: () => void;
   onOpenCreateJoinModal: () => void;
+  onOpenHomeSettings?: () => void;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
   onOpenNotifications,
-  onOpenCreateJoinModal
+  onOpenCreateJoinModal,
+  onOpenHomeSettings
 }) => {
   const { activeHome, userRole, homes, setActiveHomeId, darkMode, toggleDarkMode, unreadCount } = useAuth();
   const [showHomeDropdown, setShowHomeDropdown] = useState(false);
@@ -89,6 +91,18 @@ export const TopBar: React.FC<TopBarProps> = ({
                       </button>
                     ))}
                     <div className="border-t border-stone-100 dark:border-zinc-800 my-1.5" />
+                    {onOpenHomeSettings && (
+                      <button
+                        onClick={() => {
+                          setShowHomeDropdown(false);
+                          onOpenHomeSettings();
+                        }}
+                        className="w-full px-3 py-2 text-left flex items-center space-x-2 text-xs font-semibold text-stone-700 dark:text-stone-300 hover:bg-stone-100 dark:hover:bg-zinc-800 transition-colors"
+                      >
+                        <Settings className="w-4 h-4 text-stone-500" />
+                        <span>Home Settings & Customization</span>
+                      </button>
+                    )}
                     <button
                       onClick={() => {
                         setShowHomeDropdown(false);

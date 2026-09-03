@@ -15,9 +15,12 @@ interface AuthContextType {
   register: (name: string, email: string, pass: string, avatar?: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshHomes: () => Promise<void>;
+  refreshActiveHome: () => Promise<void>;
+  updateActiveHomeData: (updatedHome: Home) => void;
   setActiveHomeId: (homeId: string) => void;
   refreshUserData: () => Promise<void>;
   setUnreadCount: React.Dispatch<React.SetStateAction<number>>;
+  refreshUnreadCount: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -132,6 +135,27 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     refreshUserData();
   }, [refreshUserData]);
 
+  // Periodic unread notifications polling
+  const refreshUnreadCount = useCallback(async () => {
+    if (!user) return;
+    try {
+      const res = await api.getUnreadNotificationCount(activeHome?.id);
+      setUnreadCount(res.total);
+    } catch {
+      // silent
+    }
+  }, [user, activeHome?.id]);
+
+  useEffect(() => {
+    if (!user) {
+      setUnreadCount(0);
+      return;
+    }
+    refreshUnreadCount();
+    const timer = setInterval(refreshUnreadCount, 20000);
+    return () => clearInterval(timer);
+  }, [user, refreshUnreadCount]);
+
   const login = async (email: string, pass: string) => {
     const res = await api.login(email, pass);
     setUser(res.user);
@@ -164,6 +188,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+  const updateActiveHomeData = (updatedHome: Home) => {
+    setActiveHome(updatedHome);
+    setHomes(prev => prev.map(h => h.id === updatedHome.id ? updatedHome : h));
+  };
+
+  const refreshActiveHome = async () => {
+    if (activeHome) {
+      await loadHomeDetails(activeHome.id);
+      try {
+        const res = await api.getHomes();
+        setHomes(res.homes);
+      } catch (e) {
+        console.warn('Failed to refresh homes:', e);
+      }
+    }
+  };
+
   return (
     <AuthContext.Provider
       value={{
@@ -179,9 +220,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         register,
         logout,
         refreshHomes,
+        refreshActiveHome,
+        updateActiveHomeData,
         setActiveHomeId,
         refreshUserData,
-        setUnreadCount
+        setUnreadCount,
+        refreshUnreadCount
       }}
     >
       {children}

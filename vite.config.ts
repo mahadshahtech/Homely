@@ -7,7 +7,8 @@ import { apiRouter } from './server/api.ts';
 
 function homelyApiPlugin(): Plugin {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '25mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '25mb' }));
   app.use(apiRouter);
 
   return {

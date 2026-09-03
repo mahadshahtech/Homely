@@ -22,9 +22,19 @@ import type { HomeMember, FamilyEvent, FamilyMemory, VaultFile } from '../../typ
 
 type FamilySubTab = 'members' | 'events' | 'memories' | 'vault';
 
-export const FamilyView: React.FC = () => {
+interface FamilyViewProps {
+  initialSubTab?: FamilySubTab;
+}
+
+export const FamilyView: React.FC<FamilyViewProps> = ({ initialSubTab = 'members' }) => {
   const { activeHome, user, userRole } = useAuth();
-  const [subTab, setSubTab] = useState<FamilySubTab>('members');
+  const [subTab, setSubTab] = useState<FamilySubTab>(initialSubTab);
+
+  useEffect(() => {
+    if (initialSubTab) {
+      setSubTab(initialSubTab);
+    }
+  }, [initialSubTab]);
 
   // Members state
   const [members, setMembers] = useState<HomeMember[]>([]);
