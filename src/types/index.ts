@@ -167,6 +167,17 @@ export interface Message {
   readBy?: { userId: string; name: string; avatar: string; readAt: string }[];
 }
 
+export type EventRsvpStatus = 'going' | 'maybe' | 'declined';
+
+export interface EventRsvpUser {
+  userId: string;
+  name: string;
+  avatar: string;
+  email?: string;
+  status: EventRsvpStatus;
+  updatedAt: string;
+}
+
 export interface FamilyEvent {
   id: string;
   homeId: string;
@@ -175,20 +186,31 @@ export interface FamilyEvent {
   description: string;
   date: string;
   time: string;
+  endTime?: string;
   location?: string;
   attendeeIds: string[];
+  reminder?: string;
   createdAt: string;
+  updatedAt?: string;
   isAttending: boolean;
+  userRsvp?: EventRsvpStatus;
   creator: {
     id: string;
     name: string;
     avatar: string;
+    email?: string;
   };
   attendees: {
     id: string;
     name: string;
     avatar: string;
+    email?: string;
   }[];
+  rsvps?: {
+    going: EventRsvpUser[];
+    maybe: EventRsvpUser[];
+    declined: EventRsvpUser[];
+  };
 }
 
 export interface MemoryComment {

@@ -13,6 +13,8 @@ import type {
   Conversation,
   Message,
   FamilyEvent,
+  EventRsvpStatus,
+  EventRsvpUser,
   FamilyMemory,
   MemoryComment,
   MemoryReaction,
@@ -404,6 +406,24 @@ async function initDatabase(): Promise<void> {
     await safeAddColumn('memories', 'location TEXT');
     await safeAddColumn('memories', 'taggedMemberIds TEXT');
     await safeAddColumn('memories', 'updatedAt TEXT');
+
+    // Event RSVPs & details table
+    await sqliteClient.execute(`
+      CREATE TABLE IF NOT EXISTS event_rsvps (
+        id TEXT PRIMARY KEY,
+        eventId TEXT NOT NULL,
+        userId TEXT NOT NULL,
+        status TEXT NOT NULL, -- 'going' | 'maybe' | 'declined'
+        updatedAt TEXT NOT NULL,
+        UNIQUE(eventId, userId),
+        FOREIGN KEY (eventId) REFERENCES events(id) ON DELETE CASCADE,
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+
+    await safeAddColumn('events', 'endTime TEXT');
+    await safeAddColumn('events', 'reminder TEXT DEFAULT "24h"');
+    await safeAddColumn('events', 'updatedAt TEXT');
 
     // Indexes for fast lookup
     await sqliteClient.execute('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);');
@@ -1804,129 +1824,385 @@ export async function updateUserHeartbeat(userId: string, conversationId: string
 // -------------------------------------------------------------
 // EVENTS REPOSITORY
 // -------------------------------------------------------------
-export async function getEvents(homeId: string, currentUserId: string) {
-  await ensureDbReady();
-  const res = await sqliteClient.execute({
-    sql: `SELECT e.*, u.name as creatorName, u.email as creatorEmail, u.avatar as creatorAvatar
-          FROM events e
-          LEFT JOIN users u ON u.id = e.creatorId
-          WHERE e.homeId = ?
-          ORDER BY e.date ASC, e.time ASC`,
-    args: [homeId]
+async function hydrateEventRow(row: any, currentUserId?: string): Promise<FamilyEvent> {
+  const eventId = row.id as string;
+  const homeId = row.homeId as string;
+  const creatorId = row.creatorId as string;
+
+  // 1. Fetch RSVPs from event_rsvps joined with users
+  const rsvpRes = await sqliteClient.execute({
+    sql: `SELECT r.userId, r.status, r.updatedAt, u.name, u.avatar, u.email
+          FROM event_rsvps r
+          LEFT JOIN users u ON u.id = r.userId
+          WHERE r.eventId = ?
+          ORDER BY r.updatedAt ASC`,
+    args: [eventId]
   });
 
-  const events = [];
-  for (const row of res.rows) {
-    let attendeeIds: string[] = [];
-    try {
-      attendeeIds = JSON.parse(row.attendeeIds as string);
-    } catch {
-      attendeeIds = [];
+  const going: EventRsvpUser[] = [];
+  const maybe: EventRsvpUser[] = [];
+  const declined: EventRsvpUser[] = [];
+
+  let legacyAttendeeIds: string[] = [];
+  try {
+    legacyAttendeeIds = JSON.parse(row.attendeeIds as string || '[]');
+  } catch {
+    legacyAttendeeIds = [];
+  }
+
+  // If no RSVP records exist yet for this event, auto-migrate legacy attendeeIds + creator
+  if (rsvpRes.rows.length === 0) {
+    const nowIso = new Date().toISOString();
+    if (creatorId) {
+      await sqliteClient.execute({
+        sql: `INSERT OR IGNORE INTO event_rsvps (id, eventId, userId, status, updatedAt)
+              VALUES (?, ?, ?, 'going', ?)`,
+        args: [`rsvp_${eventId}_${creatorId}`, eventId, creatorId, nowIso]
+      });
+    }
+    for (const aId of legacyAttendeeIds) {
+      if (aId !== creatorId) {
+        await sqliteClient.execute({
+          sql: `INSERT OR IGNORE INTO event_rsvps (id, eventId, userId, status, updatedAt)
+                VALUES (?, ?, ?, 'going', ?)`,
+          args: [`rsvp_${eventId}_${aId}`, eventId, aId, nowIso]
+        });
+      }
     }
 
-    const attendees = [];
-    for (const aId of attendeeIds) {
-      const u = await getUserById(aId);
-      attendees.push(u ? { id: u.id, name: u.name, email: u.email, avatar: u.avatar } : { id: aId, name: 'Member', email: '', avatar: '' });
-    }
-
-    events.push({
-      id: row.id as string,
-      homeId: row.homeId as string,
-      creatorId: row.creatorId as string,
-      title: row.title as string,
-      description: (row.description as string) || '',
-      date: row.date as string,
-      time: (row.time as string) || '18:00',
-      location: (row.location as string) || undefined,
-      attendeeIds,
-      createdAt: row.createdAt as string,
-      isAttending: attendeeIds.includes(currentUserId),
-      creator: {
-        id: row.creatorId as string,
-        name: (row.creatorName as string) || 'Family Member',
-        email: (row.creatorEmail as string) || '',
-        avatar: (row.creatorAvatar as string) || ''
-      },
-      attendees
+    const migratedRsvpRes = await sqliteClient.execute({
+      sql: `SELECT r.userId, r.status, r.updatedAt, u.name, u.avatar, u.email
+            FROM event_rsvps r
+            LEFT JOIN users u ON u.id = r.userId
+            WHERE r.eventId = ?
+            ORDER BY r.updatedAt ASC`,
+      args: [eventId]
     });
+
+    for (const r of migratedRsvpRes.rows) {
+      const item: EventRsvpUser = {
+        userId: r.userId as string,
+        name: (r.name as string) || 'Family Member',
+        avatar: (r.avatar as string) || `https://api.dicebear.com/7.x/adventurer-neutral/svg?seed=${r.userId}`,
+        email: (r.email as string) || undefined,
+        status: (r.status as EventRsvpStatus) || 'going',
+        updatedAt: (r.updatedAt as string) || nowIso
+      };
+      if (item.status === 'going') going.push(item);
+      else if (item.status === 'maybe') maybe.push(item);
+      else if (item.status === 'declined') declined.push(item);
+    }
+  } else {
+    for (const r of rsvpRes.rows) {
+      const item: EventRsvpUser = {
+        userId: r.userId as string,
+        name: (r.name as string) || 'Family Member',
+        avatar: (r.avatar as string) || `https://api.dicebear.com/7.x/adventurer-neutral/svg?seed=${r.userId}`,
+        email: (r.email as string) || undefined,
+        status: (r.status as EventRsvpStatus) || 'going',
+        updatedAt: (r.updatedAt as string) || new Date().toISOString()
+      };
+      if (item.status === 'going') going.push(item);
+      else if (item.status === 'maybe') maybe.push(item);
+      else if (item.status === 'declined') declined.push(item);
+    }
+  }
+
+  // Creator details
+  const creatorUser = await getUserById(creatorId);
+  const creator = {
+    id: creatorId,
+    name: creatorUser?.name || (row.creatorName as string) || 'Family Member',
+    email: creatorUser?.email || (row.creatorEmail as string) || '',
+    avatar: creatorUser?.avatar || (row.creatorAvatar as string) || `https://api.dicebear.com/7.x/adventurer-neutral/svg?seed=${creatorId}`
+  };
+
+  // Attendees list (users who are going) for backward compatibility
+  const attendees = going.map(g => ({
+    id: g.userId,
+    name: g.name,
+    avatar: g.avatar,
+    email: g.email
+  }));
+
+  const goingUserIds = going.map(g => g.userId);
+
+  // Current user's specific status
+  let userRsvp: EventRsvpStatus | undefined = undefined;
+  if (currentUserId) {
+    if (going.some(g => g.userId === currentUserId)) {
+      userRsvp = 'going';
+    } else if (maybe.some(m => m.userId === currentUserId)) {
+      userRsvp = 'maybe';
+    } else if (declined.some(d => d.userId === currentUserId)) {
+      userRsvp = 'declined';
+    }
+  }
+
+  return {
+    id: eventId,
+    homeId,
+    creatorId,
+    title: row.title as string,
+    description: (row.description as string) || '',
+    date: row.date as string,
+    time: (row.time as string) || '18:00',
+    endTime: (row.endTime as string) || undefined,
+    location: (row.location as string) || undefined,
+    attendeeIds: goingUserIds,
+    reminder: (row.reminder as string) || '24h',
+    createdAt: row.createdAt as string,
+    updatedAt: (row.updatedAt as string) || undefined,
+    isAttending: userRsvp === 'going',
+    userRsvp,
+    creator,
+    attendees,
+    rsvps: {
+      going,
+      maybe,
+      declined
+    }
+  };
+}
+
+export async function getEvents(
+  homeId: string,
+  currentUserId: string,
+  filters?: {
+    search?: string;
+    filter?: 'upcoming' | 'past' | 'all';
+    attendeeId?: string;
+    month?: string;
+  }
+): Promise<FamilyEvent[]> {
+  await ensureDbReady();
+
+  let sql = `SELECT e.*, u.name as creatorName, u.email as creatorEmail, u.avatar as creatorAvatar
+             FROM events e
+             LEFT JOIN users u ON u.id = e.creatorId
+             WHERE e.homeId = ?`;
+  const args: any[] = [homeId];
+
+  if (filters?.search && filters.search.trim()) {
+    const q = `%${filters.search.trim().toLowerCase()}%`;
+    sql += ` AND (LOWER(e.title) LIKE ? OR LOWER(e.description) LIKE ? OR LOWER(e.location) LIKE ?)`;
+    args.push(q, q, q);
+  }
+
+  if (filters?.month && /^\d{4}-\d{2}$/.test(filters.month.trim())) {
+    sql += ` AND e.date LIKE ?`;
+    args.push(`${filters.month.trim()}%`);
+  }
+
+  const todayStr = new Date().toISOString().slice(0, 10);
+  if (filters?.filter === 'upcoming') {
+    sql += ` AND e.date >= ?`;
+    args.push(todayStr);
+  } else if (filters?.filter === 'past') {
+    sql += ` AND e.date < ?`;
+    args.push(todayStr);
+  }
+
+  if (filters?.filter === 'past') {
+    sql += ` ORDER BY e.date DESC, e.time DESC`;
+  } else {
+    sql += ` ORDER BY e.date ASC, e.time ASC`;
+  }
+
+  const res = await sqliteClient.execute({ sql, args });
+
+  const events: FamilyEvent[] = [];
+  for (const row of res.rows) {
+    const hydrated = await hydrateEventRow(row, currentUserId);
+    if (filters?.attendeeId) {
+      const matchesAttendee =
+        hydrated.attendeeIds.includes(filters.attendeeId) ||
+        hydrated.rsvps?.going.some(g => g.userId === filters.attendeeId) ||
+        hydrated.rsvps?.maybe.some(m => m.userId === filters.attendeeId);
+      if (!matchesAttendee) continue;
+    }
+    events.push(hydrated);
   }
 
   return events;
 }
 
-export async function createEvent(event: FamilyEvent): Promise<FamilyEvent> {
+export async function createEvent(event: FamilyEvent, initialAttendeeIds?: string[]): Promise<FamilyEvent> {
   await ensureDbReady();
+  const nowIso = new Date().toISOString();
+  const creatorId = event.creatorId;
+
+  const goingIds = Array.from(new Set([creatorId, ...(event.attendeeIds || [])]));
+
   await sqliteClient.execute({
-    sql: `INSERT INTO events (id, homeId, creatorId, title, description, date, time, location, attendeeIds, createdAt)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    args: [event.id, event.homeId, event.creatorId, event.title, event.description, event.date, event.time, event.location || null, JSON.stringify(event.attendeeIds), event.createdAt]
+    sql: `INSERT INTO events (id, homeId, creatorId, title, description, date, time, endTime, location, attendeeIds, reminder, createdAt, updatedAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      event.id,
+      event.homeId,
+      creatorId,
+      event.title,
+      event.description || '',
+      event.date,
+      event.time,
+      event.endTime || null,
+      event.location || null,
+      JSON.stringify(goingIds),
+      event.reminder || '24h',
+      event.createdAt || nowIso,
+      nowIso
+    ]
   });
-  return event;
+
+  // Creator is automatically RSVP'd as 'going'
+  await sqliteClient.execute({
+    sql: `INSERT OR REPLACE INTO event_rsvps (id, eventId, userId, status, updatedAt)
+          VALUES (?, ?, ?, 'going', ?)`,
+    args: [`rsvp_${event.id}_${creatorId}`, event.id, creatorId, nowIso]
+  });
+
+  // If other members were invited, add them with initial status 'maybe'
+  if (initialAttendeeIds && initialAttendeeIds.length > 0) {
+    for (const aId of initialAttendeeIds) {
+      if (aId !== creatorId) {
+        await sqliteClient.execute({
+          sql: `INSERT OR REPLACE INTO event_rsvps (id, eventId, userId, status, updatedAt)
+                VALUES (?, ?, ?, 'maybe', ?)`,
+          args: [`rsvp_${event.id}_${aId}`, event.id, aId, nowIso]
+        });
+      }
+    }
+  }
+
+  const hydrated = await getEventById(event.id, creatorId);
+  return hydrated || event;
 }
 
-export async function getEventById(eventId: string): Promise<FamilyEvent | null> {
+export async function getEventById(eventId: string, currentUserId?: string): Promise<FamilyEvent | null> {
   await ensureDbReady();
   const res = await sqliteClient.execute({
-    sql: 'SELECT * FROM events WHERE id = ? LIMIT 1',
+    sql: `SELECT e.*, u.name as creatorName, u.email as creatorEmail, u.avatar as creatorAvatar
+          FROM events e
+          LEFT JOIN users u ON u.id = e.creatorId
+          WHERE e.id = ? LIMIT 1`,
     args: [eventId]
   });
   if (res.rows.length === 0) return null;
-  const row = res.rows[0];
-  let attendeeIds: string[] = [];
-  try {
-    attendeeIds = JSON.parse(row.attendeeIds as string);
-  } catch {
-    attendeeIds = [];
+  return await hydrateEventRow(res.rows[0], currentUserId);
+}
+
+export async function updateEvent(
+  eventId: string,
+  updates: Partial<FamilyEvent>,
+  currentUserId?: string
+): Promise<FamilyEvent | null> {
+  await ensureDbReady();
+  const existing = await getEventById(eventId, currentUserId);
+  if (!existing) return null;
+
+  const nowIso = new Date().toISOString();
+  const title = updates.title !== undefined ? updates.title : existing.title;
+  const description = updates.description !== undefined ? updates.description : existing.description;
+  const date = updates.date !== undefined ? updates.date : existing.date;
+  const time = updates.time !== undefined ? updates.time : existing.time;
+  const endTime = updates.endTime !== undefined ? updates.endTime : existing.endTime;
+  const location = updates.location !== undefined ? updates.location : existing.location;
+  const reminder = updates.reminder !== undefined ? updates.reminder : existing.reminder;
+
+  await sqliteClient.execute({
+    sql: `UPDATE events
+          SET title = ?, description = ?, date = ?, time = ?, endTime = ?, location = ?, reminder = ?, updatedAt = ?
+          WHERE id = ?`,
+    args: [title, description, date, time, endTime || null, location || null, reminder || '24h', nowIso, eventId]
+  });
+
+  // If attendeeIds were specified in updates, ensure records in event_rsvps
+  if (updates.attendeeIds && Array.isArray(updates.attendeeIds)) {
+    for (const aId of updates.attendeeIds) {
+      await sqliteClient.execute({
+        sql: `INSERT OR IGNORE INTO event_rsvps (id, eventId, userId, status, updatedAt)
+              VALUES (?, ?, ?, 'maybe', ?)`,
+        args: [`rsvp_${eventId}_${aId}`, eventId, aId, nowIso]
+      });
+    }
   }
+
+  return await getEventById(eventId, currentUserId);
+}
+
+export async function setEventRsvp(
+  eventId: string,
+  userId: string,
+  status: EventRsvpStatus
+): Promise<{ success: boolean; status: EventRsvpStatus; event: FamilyEvent | null }> {
+  await ensureDbReady();
+  const event = await getEventById(eventId, userId);
+  if (!event) return { success: false, status, event: null };
+
+  const nowIso = new Date().toISOString();
+  const rsvpId = `rsvp_${eventId}_${userId}`;
+
+  await sqliteClient.execute({
+    sql: `INSERT INTO event_rsvps (id, eventId, userId, status, updatedAt)
+          VALUES (?, ?, ?, ?, ?)
+          ON CONFLICT(eventId, userId) DO UPDATE SET status = excluded.status, updatedAt = excluded.updatedAt`,
+    args: [rsvpId, eventId, userId, status, nowIso]
+  });
+
+  // Re-fetch all 'going' user IDs to keep events.attendeeIds in sync
+  const goingRes = await sqliteClient.execute({
+    sql: `SELECT userId FROM event_rsvps WHERE eventId = ? AND status = 'going'`,
+    args: [eventId]
+  });
+  const goingIds = goingRes.rows.map(r => r.userId as string);
+  await sqliteClient.execute({
+    sql: `UPDATE events SET attendeeIds = ? WHERE id = ?`,
+    args: [JSON.stringify(goingIds), eventId]
+  });
+
+  const updatedEvent = await getEventById(eventId, userId);
   return {
-    id: row.id as string,
-    homeId: row.homeId as string,
-    creatorId: row.creatorId as string,
-    title: row.title as string,
-    description: (row.description as string) || '',
-    date: row.date as string,
-    time: (row.time as string) || '18:00',
-    location: (row.location as string) || undefined,
-    attendeeIds,
-    createdAt: row.createdAt as string
+    success: true,
+    status,
+    event: updatedEvent
   };
 }
 
-export async function toggleEventRsvp(eventId: string, userId: string): Promise<{ success: boolean; isAttending: boolean; attendeeCount: number } | null> {
+export async function toggleEventRsvp(
+  eventId: string,
+  userId: string
+): Promise<{ success: boolean; isAttending: boolean; attendeeCount: number; status: EventRsvpStatus } | null> {
   await ensureDbReady();
-  const event = await getEventById(eventId);
+  const event = await getEventById(eventId, userId);
   if (!event) return null;
 
-  const idx = event.attendeeIds.indexOf(userId);
-  let isAttending = false;
-  if (idx >= 0) {
-    event.attendeeIds.splice(idx, 1);
-    isAttending = false;
-  } else {
-    event.attendeeIds.push(userId);
-    isAttending = true;
-  }
-
-  await sqliteClient.execute({
-    sql: 'UPDATE events SET attendeeIds = ? WHERE id = ?',
-    args: [JSON.stringify(event.attendeeIds), eventId]
-  });
+  const currentStatus = event.userRsvp;
+  const newStatus: EventRsvpStatus = currentStatus === 'going' ? 'declined' : 'going';
+  const result = await setEventRsvp(eventId, userId, newStatus);
 
   return {
-    success: true,
-    isAttending,
-    attendeeCount: event.attendeeIds.length
+    success: result.success,
+    isAttending: newStatus === 'going',
+    attendeeCount: result.event?.attendeeIds.length || 0,
+    status: newStatus
   };
 }
 
 export async function deleteEvent(eventId: string): Promise<boolean> {
   await ensureDbReady();
   await sqliteClient.execute({
+    sql: 'DELETE FROM event_rsvps WHERE eventId = ?',
+    args: [eventId]
+  });
+  await sqliteClient.execute({
+    sql: 'DELETE FROM notifications WHERE targetType = ? AND targetId = ?',
+    args: ['event', eventId]
+  });
+  const res = await sqliteClient.execute({
     sql: 'DELETE FROM events WHERE id = ?',
     args: [eventId]
   });
-  return true;
+  return res.rowsAffected > 0;
 }
 
 // -------------------------------------------------------------
@@ -3278,7 +3554,9 @@ export async function searchHomeRecords(
       matchedMemories = matchedMemories.filter(m =>
         m.title.toLowerCase().includes(q) ||
         m.story.toLowerCase().includes(q) ||
-        m.creator.name.toLowerCase().includes(q)
+        m.creator.name.toLowerCase().includes(q) ||
+        (m.location && m.location.toLowerCase().includes(q)) ||
+        (m.taggedMembers && m.taggedMembers.some((tm: any) => tm.name.toLowerCase().includes(q)))
       );
     }
     matchedMemories = matchedMemories.slice(0, maxLimit);

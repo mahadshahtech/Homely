@@ -345,19 +345,90 @@ export const api = {
   },
 
   // Events
-  async getEvents(homeId: string) {
-    return request<{ events: FamilyEvent[] }>(`/homes/${homeId}/events`);
+  async getEvents(
+    homeId: string,
+    params?: {
+      search?: string;
+      filter?: 'upcoming' | 'past' | 'all';
+      attendeeId?: string;
+      month?: string;
+    }
+  ) {
+    const query = new URLSearchParams();
+    if (params?.search) query.set('search', params.search);
+    if (params?.filter) query.set('filter', params.filter);
+    if (params?.attendeeId) query.set('attendeeId', params.attendeeId);
+    if (params?.month) query.set('month', params.month);
+
+    const queryString = query.toString();
+    const endpoint = `/homes/${homeId}/events${queryString ? `?${queryString}` : ''}`;
+    return request<{ events: FamilyEvent[] }>(endpoint);
   },
 
-  async createEvent(homeId: string, data: { title: string; description?: string; date: string; time?: string; location?: string }) {
+  async getEventById(homeId: string, eventId: string) {
+    return request<{ event: FamilyEvent }>(`/homes/${homeId}/events/${eventId}`);
+  },
+
+  async createEvent(
+    homeId: string,
+    data: {
+      title: string;
+      description?: string;
+      date: string;
+      time?: string;
+      endTime?: string;
+      location?: string;
+      reminder?: string;
+      attendeeIds?: string[];
+    }
+  ) {
     return request<{ event: FamilyEvent }>(`/homes/${homeId}/events`, {
       method: 'POST',
       body: JSON.stringify(data)
     });
   },
 
+  async updateEvent(
+    homeId: string,
+    eventId: string,
+    data: {
+      title?: string;
+      description?: string;
+      date?: string;
+      time?: string;
+      endTime?: string;
+      location?: string;
+      reminder?: string;
+      attendeeIds?: string[];
+    }
+  ) {
+    return request<{ event: FamilyEvent }>(`/homes/${homeId}/events/${eventId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  },
+
+  async setEventRsvp(homeId: string, eventId: string, status: 'going' | 'maybe' | 'declined') {
+    return request<{
+      success: boolean;
+      status: 'going' | 'maybe' | 'declined';
+      isAttending: boolean;
+      attendeeCount: number;
+      event: FamilyEvent;
+    }>(`/homes/${homeId}/events/${eventId}/rsvp`, {
+      method: 'POST',
+      body: JSON.stringify({ status })
+    });
+  },
+
   async toggleRsvp(homeId: string, eventId: string) {
-    return request<{ success: boolean; isAttending: boolean; attendeeCount: number }>(`/homes/${homeId}/events/${eventId}/rsvp`, {
+    return request<{
+      success: boolean;
+      isAttending: boolean;
+      attendeeCount: number;
+      status: 'going' | 'maybe' | 'declined';
+      event?: FamilyEvent;
+    }>(`/homes/${homeId}/events/${eventId}/rsvp`, {
       method: 'POST'
     });
   },
@@ -368,15 +439,101 @@ export const api = {
     });
   },
 
-  // Memories
-  async getMemories(homeId: string) {
-    return request<{ memories: FamilyMemory[] }>(`/homes/${homeId}/memories`);
+  // Memories & Family Album
+  async getMemories(
+    homeId: string,
+    params?: {
+      search?: string;
+      personId?: string;
+      startDate?: string;
+      endDate?: string;
+      sort?: 'recent' | 'oldest';
+    }
+  ) {
+    const query = new URLSearchParams();
+    if (params?.search) query.set('search', params.search);
+    if (params?.personId) query.set('personId', params.personId);
+    if (params?.startDate) query.set('startDate', params.startDate);
+    if (params?.endDate) query.set('endDate', params.endDate);
+    if (params?.sort) query.set('sort', params.sort);
+    const qs = query.toString();
+    return request<{ memories: FamilyMemory[] }>(`/homes/${homeId}/memories${qs ? `?${qs}` : ''}`);
   },
 
-  async createMemory(homeId: string, data: { title: string; story: string; date?: string; imageUrl?: string }) {
+  async getMemoryById(homeId: string, memoryId: string) {
+    return request<{ memory: FamilyMemory }>(`/homes/${homeId}/memories/${memoryId}`);
+  },
+
+  async uploadMemoryPhoto(homeId: string, fileBase64: string, fileName: string, mimeType: string) {
+    return request<{ url: string; fileName: string; mimeType: string; size: number }>(`/homes/${homeId}/memories/upload`, {
+      method: 'POST',
+      body: JSON.stringify({ fileBase64, fileName, mimeType })
+    });
+  },
+
+  async createMemory(
+    homeId: string,
+    data: {
+      title: string;
+      story: string;
+      date?: string;
+      imageUrl?: string;
+      images?: string[];
+      location?: string;
+      taggedMemberIds?: string[];
+    }
+  ) {
     return request<{ memory: FamilyMemory }>(`/homes/${homeId}/memories`, {
       method: 'POST',
       body: JSON.stringify(data)
+    });
+  },
+
+  async updateMemory(
+    homeId: string,
+    memoryId: string,
+    data: {
+      title?: string;
+      story?: string;
+      date?: string;
+      imageUrl?: string;
+      images?: string[];
+      location?: string;
+      taggedMemberIds?: string[];
+    }
+  ) {
+    return request<{ memory: FamilyMemory }>(`/homes/${homeId}/memories/${memoryId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  },
+
+  async deleteMemory(homeId: string, memoryId: string) {
+    return request<{ success: boolean }>(`/homes/${homeId}/memories/${memoryId}`, {
+      method: 'DELETE'
+    });
+  },
+
+  async toggleMemoryReaction(homeId: string, memoryId: string, emoji: string) {
+    return request<{ success: boolean; reacted: boolean; reactions: Record<string, { count: number; userIds: string[]; hasReacted: boolean }> }>(
+      `/homes/${homeId}/memories/${memoryId}/reactions`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ emoji })
+      }
+    );
+  },
+
+  async addMemoryComment(homeId: string, memoryId: string, content: string) {
+    return request<{ comment: import('../types').MemoryComment }>(`/homes/${homeId}/memories/${memoryId}/comments`, {
+      method: 'POST',
+      body: JSON.stringify({ content })
+    });
+  },
+
+  async deleteMemoryComment(homeId: string, memoryId: string, commentId: string) {
+    return request<{ success: boolean }>(`/homes/${homeId}/memories/${memoryId}/comments/${commentId}`, {
+      method: 'DELETE'
     });
   },
 

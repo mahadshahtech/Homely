@@ -773,52 +773,55 @@ export const HomeFeedView: React.FC<HomeFeedViewProps> = ({ onNavigate }) => {
             </div>
           ) : (
             <div className="grid grid-cols-2 gap-2.5">
-              {memories.slice(0, 2).map(memory => (
-                <div
-                  key={memory.id}
-                  onClick={() => onNavigate?.('family', 'memories')}
-                  className="cursor-pointer group relative rounded-2xl overflow-hidden border border-stone-200 dark:border-zinc-800 bg-stone-50 dark:bg-zinc-800/50 hover:border-amber-400 transition-all flex flex-col justify-between p-3 h-36"
-                >
-                  {memory.imageUrl ? (
-                    <>
-                      <img
-                        src={memory.imageUrl}
-                        alt={memory.title}
-                        className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                      />
-                      <div className="absolute inset-0 bg-gradient-to-t from-stone-950/80 via-stone-950/30 to-transparent" />
-                      <div className="relative z-10 flex justify-end">
-                        <span className="text-[10px] text-white/80 font-medium">
-                          {memory.date}
-                        </span>
+              {memories.slice(0, 2).map(memory => {
+                const coverPhoto = (memory.images && memory.images.length > 0) ? memory.images[0] : memory.imageUrl;
+                return (
+                  <div
+                    key={memory.id}
+                    onClick={() => onNavigate?.('family', 'memories')}
+                    className="cursor-pointer group relative rounded-2xl overflow-hidden border border-stone-200 dark:border-zinc-800 bg-stone-50 dark:bg-zinc-800/50 hover:border-amber-400 transition-all flex flex-col justify-between p-3 h-36"
+                  >
+                    {coverPhoto ? (
+                      <>
+                        <img
+                          src={coverPhoto}
+                          alt={memory.title}
+                          className="absolute inset-0 w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                        />
+                        <div className="absolute inset-0 bg-gradient-to-t from-stone-950/80 via-stone-950/30 to-transparent" />
+                        <div className="relative z-10 flex justify-end">
+                          <span className="text-[10px] text-white/80 font-medium">
+                            {memory.date}
+                          </span>
+                        </div>
+                        <div className="relative z-10 text-white">
+                          <h4 className="text-xs font-bold font-serif line-clamp-1">
+                            {memory.title}
+                          </h4>
+                          <p className="text-[10px] text-white/80 line-clamp-1 mt-0.5">
+                            {memory.story}
+                          </p>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="flex flex-col justify-between h-full">
+                        <div className="flex items-center justify-between text-stone-400">
+                          <BookOpen className="w-3.5 h-3.5 text-amber-500" />
+                          <span className="text-[10px] text-stone-400">{memory.date}</span>
+                        </div>
+                        <div>
+                          <h4 className="text-xs font-bold text-stone-900 dark:text-stone-100 font-serif line-clamp-1">
+                            {memory.title}
+                          </h4>
+                          <p className="text-[10px] text-stone-500 dark:text-stone-400 line-clamp-2 mt-1">
+                            {memory.story}
+                          </p>
+                        </div>
                       </div>
-                      <div className="relative z-10 text-white">
-                        <h4 className="text-xs font-bold font-serif line-clamp-1">
-                          {memory.title}
-                        </h4>
-                        <p className="text-[10px] text-white/80 line-clamp-1 mt-0.5">
-                          {memory.story}
-                        </p>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="flex flex-col justify-between h-full">
-                      <div className="flex items-center justify-between text-stone-400">
-                        <BookOpen className="w-3.5 h-3.5 text-amber-500" />
-                        <span className="text-[10px] text-stone-400">{memory.date}</span>
-                      </div>
-                      <div>
-                        <h4 className="text-xs font-bold text-stone-900 dark:text-stone-100 font-serif line-clamp-1">
-                          {memory.title}
-                        </h4>
-                        <p className="text-[10px] text-stone-500 dark:text-stone-400 line-clamp-2 mt-1">
-                          {memory.story}
-                        </p>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
         </section>

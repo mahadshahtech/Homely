@@ -53,10 +53,19 @@ import {
   getEvents,
   getEventById,
   createEvent,
+  updateEvent,
+  setEventRsvp,
   toggleEventRsvp,
   deleteEvent,
   getMemories,
+  getMemoryById,
   createMemory,
+  updateMemory,
+  deleteMemory,
+  toggleMemoryReaction,
+  addMemoryComment,
+  getMemoryCommentById,
+  deleteMemoryComment,
   getVaultFiles,
   createVaultFile,
   getNotifications,
@@ -1340,11 +1349,36 @@ apiRouter.get('/homes/:homeId/events', requireAuth, async (req: AuthRequest, res
     const { homeId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const events = await getEvents(homeId, req.user!.id);
+    const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+    const filter = (req.query.filter === 'upcoming' || req.query.filter === 'past' || req.query.filter === 'all')
+      ? req.query.filter
+      : undefined;
+    const attendeeId = typeof req.query.attendeeId === 'string' ? req.query.attendeeId : undefined;
+    const month = typeof req.query.month === 'string' ? req.query.month : undefined;
+
+    const events = await getEvents(homeId, req.user!.id, { search, filter, attendeeId, month });
     res.json({ events });
   } catch (err) {
     console.error('Get events error:', err);
     res.status(500).json({ error: 'Failed to retrieve events' });
+  }
+});
+
+apiRouter.get('/homes/:homeId/events/:eventId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, eventId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const event = await getEventById(eventId, req.user!.id);
+    if (!event || event.homeId !== homeId) {
+      res.status(404).json({ error: 'Event not found' });
+      return;
+    }
+
+    res.json({ event });
+  } catch (err) {
+    console.error('Get event error:', err);
+    res.status(500).json({ error: 'Failed to retrieve event' });
   }
 });
 
@@ -1353,9 +1387,19 @@ apiRouter.post('/homes/:homeId/events', requireAuth, async (req: AuthRequest, re
     const { homeId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const { title, description, date, time, location } = req.body;
-    if (!title || !date) {
-      res.status(400).json({ error: 'Title and date are required' });
+    const { title, description, date, time, endTime, location, reminder, attendeeIds } = req.body;
+    if (!title || !title.trim()) {
+      res.status(400).json({ error: 'Event title is required' });
+      return;
+    }
+    if (!date || !date.trim()) {
+      res.status(400).json({ error: 'Event date is required' });
+      return;
+    }
+
+    // End time validation: if end time is given and same day, verify order
+    if (endTime && time && endTime < time) {
+      res.status(400).json({ error: 'End time must be after start time' });
       return;
     }
 
@@ -1365,16 +1409,19 @@ apiRouter.post('/homes/:homeId/events', requireAuth, async (req: AuthRequest, re
       creatorId: req.user!.id,
       title: title.trim(),
       description: description ? description.trim() : '',
-      date,
-      time: time || '18:00',
+      date: date.trim(),
+      time: time ? time.trim() : '18:00',
+      endTime: endTime ? endTime.trim() : undefined,
       location: location ? location.trim() : undefined,
+      reminder: reminder ? reminder.trim() : '24h',
       attendeeIds: [req.user!.id],
       createdAt: new Date().toISOString()
     };
 
-    await createEvent(newEvent);
+    const initialAttendees = Array.isArray(attendeeIds) ? attendeeIds : [];
+    const savedEvent = await createEvent(newEvent, initialAttendees);
 
-    // Notify members
+    // Notify members of the home
     const members = await getHomeMembers(homeId);
     for (const m of members) {
       if (m.userId !== req.user!.id) {
@@ -1384,20 +1431,104 @@ apiRouter.post('/homes/:homeId/events', requireAuth, async (req: AuthRequest, re
           recipientId: m.userId,
           senderId: req.user!.id,
           type: 'event_created',
-          title: `New Event: ${newEvent.title}`,
-          body: `${req.user!.name} scheduled ${newEvent.title} for ${date} at ${time || '18:00'}${location ? ' • ' + location : ''}`,
+          title: `New Event: ${savedEvent.title}`,
+          body: `${req.user!.name} scheduled "${savedEvent.title}" for ${savedEvent.date} at ${savedEvent.time}${savedEvent.location ? ' • ' + savedEvent.location : ''}`,
           targetType: 'event',
-          targetId: newEvent.id,
+          targetId: savedEvent.id,
           read: false,
           createdAt: new Date().toISOString()
         });
       }
     }
 
-    res.status(201).json({ event: newEvent });
+    res.status(201).json({ event: savedEvent });
   } catch (err) {
     console.error('Create event error:', err);
     res.status(500).json({ error: 'Failed to schedule event' });
+  }
+});
+
+apiRouter.put('/homes/:homeId/events/:eventId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, eventId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const existing = await getEventById(eventId, req.user!.id);
+    if (!existing || existing.homeId !== homeId) {
+      res.status(404).json({ error: 'Event not found' });
+      return;
+    }
+
+    const userRole = await getUserRoleInHome(req.user!.id, homeId);
+    if (existing.creatorId !== req.user!.id && userRole !== 'owner' && userRole !== 'admin') {
+      res.status(403).json({ error: 'You do not have permission to edit this event' });
+      return;
+    }
+
+    const { title, description, date, time, endTime, location, reminder, attendeeIds } = req.body;
+    if (title !== undefined && !title.trim()) {
+      res.status(400).json({ error: 'Event title cannot be empty' });
+      return;
+    }
+    if (date !== undefined && !date.trim()) {
+      res.status(400).json({ error: 'Event date cannot be empty' });
+      return;
+    }
+
+    const checkStartTime = time !== undefined ? time : existing.time;
+    const checkEndTime = endTime !== undefined ? endTime : existing.endTime;
+    if (checkEndTime && checkStartTime && checkEndTime < checkStartTime) {
+      res.status(400).json({ error: 'End time must be after start time' });
+      return;
+    }
+
+    const updated = await updateEvent(
+      eventId,
+      {
+        title: title ? title.trim() : undefined,
+        description: description !== undefined ? description.trim() : undefined,
+        date: date ? date.trim() : undefined,
+        time: time ? time.trim() : undefined,
+        endTime: endTime !== undefined ? (endTime.trim() || undefined) : undefined,
+        location: location !== undefined ? (location.trim() || undefined) : undefined,
+        reminder: reminder !== undefined ? reminder.trim() : undefined,
+        attendeeIds: Array.isArray(attendeeIds) ? attendeeIds : undefined
+      },
+      req.user!.id
+    );
+
+    if (!updated) {
+      res.status(500).json({ error: 'Failed to update event' });
+      return;
+    }
+
+    // Notify attendees of event update
+    const notifiedUserIds = new Set<string>();
+    if (updated.attendees) {
+      for (const a of updated.attendees) {
+        if (a.id !== req.user!.id) notifiedUserIds.add(a.id);
+      }
+    }
+    for (const uid of notifiedUserIds) {
+      await createNotification({
+        id: `n_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        homeId,
+        recipientId: uid,
+        senderId: req.user!.id,
+        type: 'event_reminder',
+        title: `Updated Event: ${updated.title}`,
+        body: `${req.user!.name} updated "${updated.title}" (${updated.date} at ${updated.time})`,
+        targetType: 'event',
+        targetId: updated.id,
+        read: false,
+        createdAt: new Date().toISOString()
+      });
+    }
+
+    res.json({ event: updated });
+  } catch (err) {
+    console.error('Update event error:', err);
+    res.status(500).json({ error: 'Failed to update event' });
   }
 });
 
@@ -1406,28 +1537,46 @@ apiRouter.post('/homes/:homeId/events/:eventId/rsvp', requireAuth, async (req: A
     const { homeId, eventId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const event = await getEventById(eventId);
-    if (!event) {
+    const event = await getEventById(eventId, req.user!.id);
+    if (!event || event.homeId !== homeId) {
       res.status(404).json({ error: 'Event not found' });
       return;
     }
 
-    const result = await toggleEventRsvp(eventId, req.user!.id);
-    if (!result) {
-      res.status(404).json({ error: 'Event not found' });
-      return;
+    const { status } = req.body;
+    let resultStatus: 'going' | 'maybe' | 'declined';
+    let updatedEvent: FamilyEvent | null = null;
+
+    if (status === 'going' || status === 'maybe' || status === 'declined') {
+      const resData = await setEventRsvp(eventId, req.user!.id, status);
+      resultStatus = resData.status;
+      updatedEvent = resData.event;
+    } else {
+      // Legacy toggle fallback
+      const resData = await toggleEventRsvp(eventId, req.user!.id);
+      if (!resData) {
+        res.status(500).json({ error: 'Failed to update RSVP' });
+        return;
+      }
+      resultStatus = resData.status;
+      updatedEvent = await getEventById(eventId, req.user!.id);
     }
 
     // Notify event creator of RSVP update if not self
     if (event.creatorId !== req.user!.id) {
+      let rsvpText = 'updated their RSVP to';
+      if (resultStatus === 'going') rsvpText = 'is attending';
+      else if (resultStatus === 'maybe') rsvpText = 'marked maybe for';
+      else if (resultStatus === 'declined') rsvpText = 'cannot attend';
+
       await createNotification({
         id: `n_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
         homeId,
         recipientId: event.creatorId,
         senderId: req.user!.id,
         type: 'event_rsvp',
-        title: result.isAttending ? `${req.user!.name} RSVP'd to your event` : `${req.user!.name} updated RSVP`,
-        body: result.isAttending ? `Attending: "${event.title}" on ${event.date}` : `Cannot attend: "${event.title}"`,
+        title: `${req.user!.name} RSVP'd to "${event.title}"`,
+        body: `${req.user!.name} ${rsvpText} "${event.title}" on ${event.date}`,
         targetType: 'event',
         targetId: event.id,
         read: false,
@@ -1435,7 +1584,13 @@ apiRouter.post('/homes/:homeId/events/:eventId/rsvp', requireAuth, async (req: A
       });
     }
 
-    res.json(result);
+    res.json({
+      success: true,
+      status: resultStatus,
+      isAttending: resultStatus === 'going',
+      attendeeCount: updatedEvent?.attendeeIds.length || 0,
+      event: updatedEvent
+    });
   } catch (err) {
     console.error('RSVP error:', err);
     res.status(500).json({ error: 'Failed to update RSVP' });
@@ -1447,15 +1602,15 @@ apiRouter.delete('/homes/:homeId/events/:eventId', requireAuth, async (req: Auth
     const { homeId, eventId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const event = await getEventById(eventId);
-    if (!event) {
+    const event = await getEventById(eventId, req.user!.id);
+    if (!event || event.homeId !== homeId) {
       res.status(404).json({ error: 'Event not found' });
       return;
     }
 
     const userRole = await getUserRoleInHome(req.user!.id, homeId);
     if (event.creatorId !== req.user!.id && userRole !== 'owner' && userRole !== 'admin') {
-      res.status(403).json({ error: 'Permission denied' });
+      res.status(403).json({ error: 'You do not have permission to delete this event' });
       return;
     }
 
@@ -1468,15 +1623,63 @@ apiRouter.delete('/homes/:homeId/events/:eventId', requireAuth, async (req: Auth
 });
 
 // -------------------------------------------------------------
-// MEMORIES
+// MEMORIES & FAMILY ALBUM
 // -------------------------------------------------------------
 
+// Upload media for memory (stored locally on disk under data/uploads)
+apiRouter.post('/homes/:homeId/memories/upload', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const { fileBase64, fileName, mimeType } = req.body;
+    if (!fileBase64 || typeof fileBase64 !== 'string') {
+      res.status(400).json({ error: 'Image data is required' });
+      return;
+    }
+
+    const safeNameClean = (fileName || 'memory_photo').replace(/[^a-zA-Z0-9._-]/g, '_');
+    const ext = path.extname(safeNameClean) || (mimeType?.includes('png') ? '.png' : mimeType?.includes('webp') ? '.webp' : '.jpg');
+    const diskFileName = `mem_${Date.now()}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+    const filePath = path.join(UPLOADS_DIR, diskFileName);
+
+    // Strip data URL prefix if present
+    const cleanBase64 = fileBase64.replace(/^data:.*?;base64,/, '');
+    const buffer = Buffer.from(cleanBase64, 'base64');
+
+    await fs.promises.writeFile(filePath, buffer);
+
+    res.status(201).json({
+      url: `/api/uploads/${diskFileName}`,
+      fileName: fileName || diskFileName,
+      mimeType: mimeType || 'image/jpeg',
+      size: buffer.length
+    });
+  } catch (err) {
+    console.error('Memory photo upload error:', err);
+    res.status(500).json({ error: 'Failed to upload memory photo' });
+  }
+});
+
+// List memories with search and filters
 apiRouter.get('/homes/:homeId/memories', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const memories = await getMemories(homeId);
+    const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+    const personId = typeof req.query.personId === 'string' && req.query.personId ? req.query.personId : undefined;
+    const startDate = typeof req.query.startDate === 'string' && req.query.startDate ? req.query.startDate : undefined;
+    const endDate = typeof req.query.endDate === 'string' && req.query.endDate ? req.query.endDate : undefined;
+    const sort = req.query.sort === 'oldest' ? 'oldest' : 'recent';
+
+    const memories = await getMemories(homeId, req.user!.id, {
+      search,
+      personId,
+      startDate,
+      endDate,
+      sort
+    });
     res.json({ memories });
   } catch (err) {
     console.error('Get memories error:', err);
@@ -1484,54 +1687,334 @@ apiRouter.get('/homes/:homeId/memories', requireAuth, async (req: AuthRequest, r
   }
 });
 
+// Get single memory by ID
+apiRouter.get('/homes/:homeId/memories/:memoryId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, memoryId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const memory = await getMemoryById(memoryId, req.user!.id);
+    if (!memory || memory.homeId !== homeId) {
+      res.status(404).json({ error: 'Memory not found' });
+      return;
+    }
+
+    res.json({ memory });
+  } catch (err) {
+    console.error('Get memory by ID error:', err);
+    res.status(500).json({ error: 'Failed to retrieve memory' });
+  }
+});
+
+// Create memory
 apiRouter.post('/homes/:homeId/memories', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const { title, story, date, imageUrl } = req.body;
+    const { title, story, date, imageUrl, images, location, taggedMemberIds } = req.body;
     if (!title || !story) {
-      res.status(400).json({ error: 'Title and story are required' });
+      res.status(400).json({ error: 'Title and story/caption are required' });
       return;
     }
 
+    const trimmedTitle = title.trim();
+    const trimmedStory = story.trim();
+    if (!trimmedTitle || !trimmedStory) {
+      res.status(400).json({ error: 'Title and story cannot be empty whitespace' });
+      return;
+    }
+
+    // Process images array
+    const imageList: string[] = [];
+    if (Array.isArray(images)) {
+      for (const img of images) {
+        if (typeof img === 'string' && img.trim()) imageList.push(img.trim());
+      }
+    }
+    if (imageList.length === 0 && imageUrl && typeof imageUrl === 'string' && imageUrl.trim()) {
+      imageList.push(imageUrl.trim());
+    }
+
+    // Process taggedMemberIds array (ensure valid strings)
+    const taggedIds: string[] = [];
+    if (Array.isArray(taggedMemberIds)) {
+      for (const tid of taggedMemberIds) {
+        if (typeof tid === 'string' && tid.trim()) taggedIds.push(tid.trim());
+      }
+    }
+
+    const now = new Date().toISOString();
     const newMemory: FamilyMemory = {
       id: `mem_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
       homeId,
       creatorId: req.user!.id,
-      title: title.trim(),
-      story: story.trim(),
-      date: date || new Date().toISOString().split('T')[0],
-      imageUrl: imageUrl ? imageUrl.trim() : undefined,
-      createdAt: new Date().toISOString()
+      title: trimmedTitle,
+      story: trimmedStory,
+      date: (date && typeof date === 'string' && date.trim()) ? date.trim() : now.split('T')[0],
+      imageUrl: imageList[0] || undefined,
+      images: imageList,
+      location: (location && typeof location === 'string' && location.trim()) ? location.trim() : undefined,
+      taggedMemberIds: taggedIds,
+      createdAt: now,
+      updatedAt: now
     };
 
     await createMemory(newMemory);
 
-    // Notify other members of new family memory
+    // Notify tagged members
+    for (const taggedId of taggedIds) {
+      if (taggedId !== req.user!.id) {
+        await createNotification({
+          id: `n_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+          homeId,
+          recipientId: taggedId,
+          senderId: req.user!.id,
+          type: 'memory_tagged',
+          title: `${req.user!.name} tagged you in a memory`,
+          body: `"${newMemory.title}"`,
+          targetType: 'memory',
+          targetId: newMemory.id,
+          read: false,
+          createdAt: now
+        });
+      }
+    }
+
+    // Notify all other home members of new family memory (except those already tagged)
     const members = await getHomeMembers(homeId);
     for (const m of members) {
-      if (m.userId !== req.user!.id) {
+      if (m.userId !== req.user!.id && !taggedIds.includes(m.userId)) {
         await createNotification({
           id: `n_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
           homeId,
           recipientId: m.userId,
           senderId: req.user!.id,
           type: 'memory_created',
-          title: `${req.user!.name} shared a family memory`,
+          title: `${req.user!.name} added a family memory`,
           body: `${newMemory.title}: ${newMemory.story.slice(0, 80)}`,
           targetType: 'memory',
           targetId: newMemory.id,
           read: false,
-          createdAt: new Date().toISOString()
+          createdAt: now
         });
       }
     }
 
-    res.status(201).json({ memory: newMemory });
+    // Retrieve full hydrated memory
+    const saved = await getMemoryById(newMemory.id, req.user!.id);
+    res.status(201).json({ memory: saved || newMemory });
   } catch (err) {
     console.error('Create memory error:', err);
     res.status(500).json({ error: 'Failed to save memory' });
+  }
+});
+
+// Update memory
+apiRouter.put('/homes/:homeId/memories/:memoryId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, memoryId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const existing = await getMemoryById(memoryId, req.user!.id);
+    if (!existing || existing.homeId !== homeId) {
+      res.status(404).json({ error: 'Memory not found' });
+      return;
+    }
+
+    const userRole = await getUserRoleInHome(req.user!.id, homeId);
+    if (existing.creatorId !== req.user!.id && userRole !== 'owner' && userRole !== 'admin') {
+      res.status(403).json({ error: 'Permission denied: You can only edit memories you created or as a home admin' });
+      return;
+    }
+
+    const { title, story, date, imageUrl, images, location, taggedMemberIds } = req.body;
+
+    const updates: Partial<FamilyMemory> = {};
+    if (title !== undefined) updates.title = String(title).trim();
+    if (story !== undefined) updates.story = String(story).trim();
+    if (date !== undefined) updates.date = String(date).trim();
+    if (location !== undefined) updates.location = location ? String(location).trim() : undefined;
+
+    if (Array.isArray(images)) {
+      updates.images = images.filter(img => typeof img === 'string' && img.trim());
+      updates.imageUrl = updates.images[0] || undefined;
+    } else if (imageUrl !== undefined) {
+      updates.imageUrl = imageUrl ? String(imageUrl).trim() : undefined;
+      updates.images = updates.imageUrl ? [updates.imageUrl] : [];
+    }
+
+    if (Array.isArray(taggedMemberIds)) {
+      updates.taggedMemberIds = taggedMemberIds.filter(tid => typeof tid === 'string' && tid.trim());
+    }
+
+    const updated = await updateMemory(memoryId, updates);
+    res.json({ memory: updated });
+  } catch (err) {
+    console.error('Update memory error:', err);
+    res.status(500).json({ error: 'Failed to update memory' });
+  }
+});
+
+// Delete memory
+apiRouter.delete('/homes/:homeId/memories/:memoryId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, memoryId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const existing = await getMemoryById(memoryId, req.user!.id);
+    if (!existing || existing.homeId !== homeId) {
+      res.status(404).json({ error: 'Memory not found' });
+      return;
+    }
+
+    const userRole = await getUserRoleInHome(req.user!.id, homeId);
+    if (existing.creatorId !== req.user!.id && userRole !== 'owner' && userRole !== 'admin') {
+      res.status(403).json({ error: 'Permission denied: You can only delete memories you created or as a home admin' });
+      return;
+    }
+
+    await deleteMemory(memoryId);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete memory error:', err);
+    res.status(500).json({ error: 'Failed to delete memory' });
+  }
+});
+
+// Toggle reaction on memory
+apiRouter.post('/homes/:homeId/memories/:memoryId/reactions', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, memoryId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const memory = await getMemoryById(memoryId, req.user!.id);
+    if (!memory || memory.homeId !== homeId) {
+      res.status(404).json({ error: 'Memory not found' });
+      return;
+    }
+
+    const { emoji } = req.body;
+    if (!emoji || typeof emoji !== 'string') {
+      res.status(400).json({ error: 'Emoji is required' });
+      return;
+    }
+
+    const result = await toggleMemoryReaction(memoryId, req.user!.id, emoji);
+
+    // Notify memory creator if a new reaction was added and user is not creator
+    if (result.reacted && memory.creatorId !== req.user!.id) {
+      await createNotification({
+        id: `n_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        homeId,
+        recipientId: memory.creatorId,
+        senderId: req.user!.id,
+        type: 'memory_reaction',
+        title: `${req.user!.name} reacted to your memory`,
+        body: `${emoji} on "${memory.title}"`,
+        targetType: 'memory',
+        targetId: memory.id,
+        read: false,
+        createdAt: new Date().toISOString()
+      });
+    }
+
+    const updated = await getMemoryById(memoryId, req.user!.id);
+    res.json({
+      success: true,
+      reacted: result.reacted,
+      reactions: updated?.reactions || {}
+    });
+  } catch (err) {
+    console.error('Toggle memory reaction error:', err);
+    res.status(500).json({ error: 'Failed to update reaction' });
+  }
+});
+
+// Add comment to memory
+apiRouter.post('/homes/:homeId/memories/:memoryId/comments', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, memoryId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const memory = await getMemoryById(memoryId, req.user!.id);
+    if (!memory || memory.homeId !== homeId) {
+      res.status(404).json({ error: 'Memory not found' });
+      return;
+    }
+
+    const { content } = req.body;
+    if (!content || typeof content !== 'string' || !content.trim()) {
+      res.status(400).json({ error: 'Comment content cannot be empty' });
+      return;
+    }
+
+    const commentId = `mc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const newComment = await addMemoryComment({
+      id: commentId,
+      memoryId,
+      authorId: req.user!.id,
+      content: content.trim(),
+      createdAt: new Date().toISOString()
+    });
+
+    // Notify memory creator if comment author is not the creator
+    if (memory.creatorId !== req.user!.id) {
+      await createNotification({
+        id: `n_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        homeId,
+        recipientId: memory.creatorId,
+        senderId: req.user!.id,
+        type: 'memory_comment',
+        title: `${req.user!.name} commented on your memory`,
+        body: `"${newComment.content.slice(0, 80)}" on "${memory.title}"`,
+        targetType: 'memory',
+        targetId: memory.id,
+        read: false,
+        createdAt: new Date().toISOString()
+      });
+    }
+
+    res.status(201).json({ comment: newComment });
+  } catch (err) {
+    console.error('Add memory comment error:', err);
+    res.status(500).json({ error: 'Failed to add comment' });
+  }
+});
+
+// Delete comment from memory
+apiRouter.delete('/homes/:homeId/memories/:memoryId/comments/:commentId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, memoryId, commentId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const memory = await getMemoryById(memoryId, req.user!.id);
+    if (!memory || memory.homeId !== homeId) {
+      res.status(404).json({ error: 'Memory not found' });
+      return;
+    }
+
+    const comment = await getMemoryCommentById(commentId);
+    if (!comment || comment.memoryId !== memoryId) {
+      res.status(404).json({ error: 'Comment not found' });
+      return;
+    }
+
+    const userRole = await getUserRoleInHome(req.user!.id, homeId);
+    const isCommentAuthor = comment.authorId === req.user!.id;
+    const isMemoryCreator = memory.creatorId === req.user!.id;
+    const isHomeAdmin = userRole === 'owner' || userRole === 'admin';
+
+    if (!isCommentAuthor && !isMemoryCreator && !isHomeAdmin) {
+      res.status(403).json({ error: 'Permission denied: You cannot delete this comment' });
+      return;
+    }
+
+    await deleteMemoryComment(commentId);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Delete memory comment error:', err);
+    res.status(500).json({ error: 'Failed to delete comment' });
   }
 });
 

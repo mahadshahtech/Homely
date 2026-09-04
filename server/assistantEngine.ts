@@ -946,13 +946,18 @@ Family Members in this Home:
 ${members.map(m => `- ${m.name} (${m.role})`).join('\n') || 'None'}
 
 Upcoming / Matching Events:
-${events.map(e => `- "${e.title}" on ${e.date} at ${e.time} (Location: ${e.location || 'Home'}). Attendees (${e.attendees.length}): ${e.attendees.map((a: any) => a.name).join(', ') || 'None yet'}`).join('\n') || 'No matching events found'}
+${events.map(e => {
+  const going = e.rsvps?.going?.map((u: any) => u.name).join(', ') || e.attendees?.map((a: any) => a.name).join(', ') || 'None';
+  const maybe = e.rsvps?.maybe?.map((u: any) => u.name).join(', ') || 'None';
+  const declined = e.rsvps?.declined?.map((u: any) => u.name).join(', ') || 'None';
+  return `- "${e.title}" on ${e.date} from ${e.time}${e.endTime ? ' to ' + e.endTime : ''} (Location: ${e.location || 'Home'}). RSVP Going: ${going}. RSVP Maybe: ${maybe}. RSVP Can't Go: ${declined}.`;
+}).join('\n') || 'No matching events found'}
 
 Family Posts & Announcements:
 ${posts.map(p => `- [${p.type.toUpperCase()}] ${p.author.name} on ${p.createdAt.slice(0, 10)}: "${p.content}"`).join('\n') || 'No posts recorded'}
 
 Family Scrapbook Memories:
-${memories.map(m => `- "${m.title}" (${m.date}): ${m.story}`).join('\n') || 'No memories found'}
+${memories.map(m => `- "${m.title}" (${m.date}${m.location ? ' in ' + m.location : ''}${m.taggedMembers && m.taggedMembers.length ? ' with ' + m.taggedMembers.map((t: any) => t.name).join(', ') : ''}): ${m.story} (Saved by ${m.creator?.name || 'Family'})`).join('\n') || 'No memories found'}
 
 Family Vault (Safe items & codes):
 ${vaultFiles.map(v => `- [${v.category}] "${v.title}": ${v.description ? v.description + ' - ' : ''}${v.contentOrUrl}`).join('\n') || 'No vault records matching'}
@@ -1119,20 +1124,29 @@ User Question:
 
   // B. Events & Calendar Questions
   if (isEventOrCal) {
-    if (lowerQ.includes('who is attending') || lowerQ.includes('attending')) {
-      // Find event
-      const targetEvent = events[0] || (await getEvents(homeId, user.id))[0];
+    // 1. Check if user is asking about who is attending / RSVP for an event
+    if (lowerQ.includes('who is attending') || lowerQ.includes('attending') || lowerQ.includes('who\'s going') || lowerQ.includes('who is going') || lowerQ.includes('rsvp')) {
+      // Find event that best matches query words
+      let targetEvent = events.find(e => {
+        const titleWords = e.title.toLowerCase().split(/\s+/);
+        return titleWords.some(w => w.length > 3 && lowerQ.includes(w));
+      }) || events[0] || (await getEvents(homeId, user.id))[0];
+
       if (targetEvent) {
-        const attendeeNames = targetEvent.attendees.map((a: any) => a.name).join(', ');
+        const goingNames = targetEvent.rsvps?.going?.map((a: any) => a.name).join(', ') || targetEvent.attendees.map((a: any) => a.name).join(', ') || 'None yet';
+        const maybeNames = targetEvent.rsvps?.maybe?.map((a: any) => a.name).join(', ') || 'None';
+        const declinedNames = targetEvent.rsvps?.declined?.map((a: any) => a.name).join(', ') || 'None';
+        const timeStr = `${targetEvent.time}${targetEvent.endTime ? ' – ' + targetEvent.endTime : ''}`;
+
         return {
-          reply: `For **"${targetEvent.title}"** on **${targetEvent.date}** at **${targetEvent.time}**:\n\n• **Attending (${targetEvent.attendees.length}):** ${attendeeNames || 'None yet'}\n• **Location:** ${targetEvent.location || 'Home'}`,
+          reply: `For **"${targetEvent.title}"** on **${targetEvent.date}** at **${timeStr}**:\n\n• **Going (${targetEvent.rsvps?.going?.length ?? targetEvent.attendees.length}):** ${goingNames}\n• **Maybe (${targetEvent.rsvps?.maybe?.length ?? 0}):** ${maybeNames}\n• **Can't Go (${targetEvent.rsvps?.declined?.length ?? 0}):** ${declinedNames}\n• **Location:** ${targetEvent.location || 'Home'}`,
           source: 'events',
           results: [
             {
               type: 'event',
               title: targetEvent.title,
-              subtitle: `${targetEvent.date} at ${targetEvent.time}`,
-              details: `${targetEvent.attendees.length} attending: ${attendeeNames || 'No RSVPs yet'}`,
+              subtitle: `${targetEvent.date} at ${timeStr}`,
+              details: `${targetEvent.attendees.length} attending: ${goingNames}`,
               data: targetEvent
             }
           ]
@@ -1140,18 +1154,42 @@ User Question:
       }
     }
 
+    // 2. Check if user asks "when is [dinner / event]?"
+    const matchedEvent = events.find(e => {
+      const titleWords = e.title.toLowerCase().split(/\s+/);
+      return titleWords.some(w => w.length > 3 && lowerQ.includes(w));
+    });
+
+    if (matchedEvent) {
+      const timeStr = `${matchedEvent.time}${matchedEvent.endTime ? ' – ' + matchedEvent.endTime : ''}`;
+      return {
+        reply: `**"${matchedEvent.title}"** is scheduled for **${matchedEvent.date}** at **${timeStr}**${matchedEvent.location ? ` at **${matchedEvent.location}**` : ''}.\n\n• **Going:** ${matchedEvent.rsvps?.going?.map(g => g.name).join(', ') || matchedEvent.attendees.map(a => a.name).join(', ') || 'None yet'}\n${matchedEvent.description ? `• **Details:** ${matchedEvent.description}` : ''}`,
+        source: 'events',
+        results: [{
+          type: 'event',
+          title: matchedEvent.title,
+          subtitle: `${matchedEvent.date} at ${timeStr}`,
+          details: `${matchedEvent.location ? `📍 ${matchedEvent.location} • ` : ''}${matchedEvent.attendees.length} attending`,
+          data: matchedEvent
+        }],
+        sources: [{ type: 'events', title: 'Family Events Calendar' }]
+      };
+    }
+
+    // 3. General list of events
     if (events.length > 0) {
-      const eventList = events.map(e =>
-        `• **${e.title}** on **${e.date}** at **${e.time}**${e.location ? ` at ${e.location}` : ''} (${e.attendees.length} attending)`
-      ).join('\n');
+      const eventList = events.map(e => {
+        const timeStr = `${e.time}${e.endTime ? ' – ' + e.endTime : ''}`;
+        return `• **${e.title}** on **${e.date}** at **${timeStr}**${e.location ? ` at ${e.location}` : ''} (${e.attendees.length} attending)`;
+      }).join('\n');
 
       return {
-        reply: `Here are the events found for **${home?.name}**:\n\n${eventList}`,
+        reply: `Here are the upcoming events on the family calendar for **${home?.name}**:\n\n${eventList}`,
         source: 'events',
-        results: events.slice(0, 3).map(e => ({
+        results: events.slice(0, 4).map(e => ({
           type: 'event',
           title: e.title,
-          subtitle: `${e.date} at ${e.time}`,
+          subtitle: `${e.date} at ${e.time}${e.endTime ? ' – ' + e.endTime : ''}`,
           details: `${e.location ? `📍 ${e.location} • ` : ''}${e.attendees.length} attending`,
           data: e
         })),
@@ -1263,7 +1301,14 @@ User Question:
   // E. Memories
   if (isMemoryOrStory) {
     if (memories.length > 0) {
-      const list = memories.map(m => `• **${m.title}** (${m.date}): ${m.story}`).join('\n');
+      const list = memories.map(m => {
+        const details = [
+          m.date,
+          m.location ? `📍 ${m.location}` : '',
+          m.taggedMembers && m.taggedMembers.length ? `👥 with ${m.taggedMembers.map((t: any) => t.name).join(', ')}` : ''
+        ].filter(Boolean).join(' • ');
+        return `• **${m.title}** (${details}): ${m.story}`;
+      }).join('\n');
       return {
         reply: `Here are the scrapbook memories for **${home?.name}**:\n\n${list}`,
         source: 'memories',
