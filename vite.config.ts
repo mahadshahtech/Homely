@@ -4,6 +4,7 @@ import path from 'path';
 import express from 'express';
 import { defineConfig, type Plugin } from 'vite';
 import { apiRouter } from './server/api.ts';
+import { setupRealtimeServer } from './server/realtime.ts';
 
 function homelyApiPlugin(): Plugin {
   const app = express();
@@ -17,6 +18,10 @@ function homelyApiPlugin(): Plugin {
       server.middlewares.use('/api', (req, res, next) => {
         app(req as any, res as any, next);
       });
+
+      if (server.httpServer) {
+        setupRealtimeServer(server.httpServer);
+      }
     },
   };
 }

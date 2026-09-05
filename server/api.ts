@@ -5,6 +5,12 @@ import fs from 'fs';
 import path from 'path';
 import { GoogleGenAI } from '@google/genai';
 import {
+  broadcastToConversation,
+  broadcastToHome,
+  sendToUser,
+  isUserOnline
+} from './realtime.ts';
+import {
   getUserByEmail,
   getUserById,
   getUserByToken,
@@ -67,7 +73,10 @@ import {
   getMemoryCommentById,
   deleteMemoryComment,
   getVaultFiles,
+  getVaultFileById,
   createVaultFile,
+  updateVaultFile,
+  deleteVaultFile,
   getNotifications,
   getUnreadNotificationCount,
   createNotification,
@@ -84,9 +93,23 @@ import {
   updateAskHomelyMessageAction,
   getAssistantMemories,
   deleteAssistantMemoryById,
-  deleteAssistantMemory
+  deleteAssistantMemory,
+  getUserPushSubscriptions,
+  savePushSubscription,
+  deletePushSubscription,
+  deletePushSubscriptionByEndpoint,
+  setOnNotificationCreated
 } from './db.ts';
+import {
+  getVapidPublicKey,
+  deliverPushNotification,
+  sendTestPushToUser
+} from './pushService.ts';
+
+// Hook up automatic push notification delivery for all in-app notifications
+setOnNotificationCreated(deliverPushNotification);
 import { processAssistantQuery, executeAssistantAction } from './assistantEngine.ts';
+import { encryptBuffer, decryptBuffer, encryptText, decryptText } from './vaultCrypto.ts';
 import type {
   User,
   Home,
@@ -113,9 +136,21 @@ try {
   // directory already exists or error
 }
 
+// Ensure private, non-public vault encrypted storage directory exists
+const VAULT_STORAGE_DIR = path.resolve(process.cwd(), 'data', 'vault_storage');
+try {
+  fs.mkdirSync(VAULT_STORAGE_DIR, { recursive: true });
+} catch {
+  // directory already exists or error
+}
+
 export const apiRouter = express.Router();
 apiRouter.use(express.json({ limit: '25mb' }));
 apiRouter.use(express.urlencoded({ extended: true, limit: '25mb' }));
+
+apiRouter.get('/health', (req: Request, res: Response) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
+});
 
 // Static media uploads endpoint
 apiRouter.get('/uploads/:fileId', (req: Request, res: Response) => {
@@ -719,6 +754,32 @@ apiRouter.get('/homes/:homeId/dashboard', requireAuth, async (req: AuthRequest, 
   }
 });
 
+// Home sync & reconciliation aggregator
+apiRouter.get('/homes/:homeId/sync', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const dashboard = await getHomeDashboardData(homeId, req.user!.id);
+    if (!dashboard) {
+      res.status(404).json({ error: 'Home not found' });
+      return;
+    }
+
+    const conversations = await getConversationsForUser(homeId, req.user!.id);
+
+    res.json({
+      homeId,
+      serverTime: new Date().toISOString(),
+      dashboard,
+      conversations
+    });
+  } catch (err) {
+    console.error('Home sync error:', err);
+    res.status(500).json({ error: 'Failed to sync home data' });
+  }
+});
+
 // -------------------------------------------------------------
 // POSTS & FEED
 // -------------------------------------------------------------
@@ -741,16 +802,31 @@ apiRouter.post('/homes/:homeId/posts', requireAuth, async (req: AuthRequest, res
     const { homeId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const { content, type, imageUrl } = req.body;
+    const { content, type, imageUrl, clientPostId } = req.body;
     if (!content || typeof content !== 'string' || content.trim().length === 0) {
       res.status(400).json({ error: 'Post content cannot be empty' });
       return;
     }
 
+    if (clientPostId) {
+      const existing = await getPostById(clientPostId);
+      if (existing) {
+        res.status(200).json({
+          post: {
+            ...existing,
+            author: sanitizeUser(req.user!),
+            comments: [],
+            reactions: {}
+          }
+        });
+        return;
+      }
+    }
+
     const postType = ['update', 'photo', 'announcement', 'memory'].includes(type) ? type : 'update';
 
     const newPost: Post = {
-      id: `post_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      id: clientPostId || `post_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
       homeId,
       authorId: req.user!.id,
       content: content.trim(),
@@ -842,7 +918,7 @@ apiRouter.post('/homes/:homeId/posts/:postId/comments', requireAuth, async (req:
     const { homeId, postId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const { content } = req.body;
+    const { content, clientCommentId } = req.body;
     if (!content || typeof content !== 'string' || content.trim().length === 0) {
       res.status(400).json({ error: 'Comment cannot be empty' });
       return;
@@ -854,8 +930,10 @@ apiRouter.post('/homes/:homeId/posts/:postId/comments', requireAuth, async (req:
       return;
     }
 
+    const commentId = clientCommentId || `c_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+
     const newComment: PostComment = {
-      id: `c_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      id: commentId,
       postId,
       authorId: req.user!.id,
       content: content.trim(),
@@ -953,7 +1031,19 @@ apiRouter.get('/homes/:homeId/conversations', requireAuth, async (req: AuthReque
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
     const populated = await getConversationsForUser(homeId, req.user!.id);
-    res.json({ conversations: populated });
+    // Enrich with live WebSocket online presence
+    const enriched = populated.map(conv => {
+      if (conv.type === 'direct') {
+        const other = conv.participants.find(p => p.id !== req.user!.id);
+        const liveOnline = other ? isUserOnline(other.id) : false;
+        return {
+          ...conv,
+          isOnline: conv.isOnline || liveOnline
+        };
+      }
+      return conv;
+    });
+    res.json({ conversations: enriched });
   } catch (err) {
     console.error('Get conversations error:', err);
     res.status(500).json({ error: 'Failed to retrieve conversations' });
@@ -978,9 +1068,11 @@ apiRouter.post('/homes/:homeId/conversations/direct', requireAuth, async (req: A
       return;
     }
 
+    let isNew = false;
     let directConv = await findDirectConversation(homeId, currentUserId, targetUserId);
 
     if (!directConv) {
+      isNew = true;
       directConv = {
         id: `conv_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
         homeId,
@@ -990,6 +1082,10 @@ apiRouter.post('/homes/:homeId/conversations/direct', requireAuth, async (req: A
         updatedAt: new Date().toISOString()
       };
       await createConversation(directConv);
+    }
+
+    if (isNew) {
+      broadcastToHome(homeId, 'conversation:created', { conversation: directConv });
     }
 
     res.json({ conversation: directConv });
@@ -1016,6 +1112,20 @@ apiRouter.get('/homes/:homeId/conversations/:conversationId/messages', requireAu
     }
 
     const messages = await getMessages(conversationId, req.user!.id);
+
+    // Broadcast read receipt event to other participants in this conversation
+    broadcastToConversation(
+      conversationId,
+      'conversation:read',
+      {
+        conversationId,
+        userId: req.user!.id,
+        userName: req.user!.name,
+        readAt: new Date().toISOString()
+      },
+      req.user!.id
+    );
+
     res.json({ messages });
   } catch (err) {
     console.error('Get messages error:', err);
@@ -1083,8 +1193,24 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages', requireA
       mediaSize,
       mediaDuration,
       extraData,
-      isPinned
+      isPinned,
+      clientMessageId
     } = req.body;
+
+    // Idempotency check: if message with clientMessageId already exists, return it
+    if (clientMessageId) {
+      const existing = await getMessageById(clientMessageId);
+      if (existing) {
+        res.status(200).json({
+          message: {
+            ...existing,
+            isOwn: existing.senderId === req.user!.id,
+            sender: sanitizeUser(req.user!)
+          }
+        });
+        return;
+      }
+    }
 
     const trimmedContent = typeof content === 'string' ? content.trim() : '';
 
@@ -1094,7 +1220,7 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages', requireA
     }
 
     const newMsg: Message = {
-      id: `m_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      id: clientMessageId || `m_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
       conversationId,
       senderId: req.user!.id,
       content: trimmedContent,
@@ -1177,15 +1303,66 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages', requireA
       }
     }
 
+    // Resolve replyTo details for rich realtime payload
+    let replyTo = undefined;
+    if (replyToId) {
+      try {
+        const parentMsg = await getMessageById(replyToId);
+        if (parentMsg) {
+          const parentSender = await getUserById(parentMsg.senderId);
+          replyTo = {
+            id: parentMsg.id,
+            senderName: parentSender?.name || 'Family Member',
+            content: parentMsg.content || '',
+            mediaType: parentMsg.mediaType || undefined
+          };
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const sanitizedSender = sanitizeUser(req.user!);
+
+    // Realtime message broadcast to conversation room
+    broadcastToConversation(conversationId, 'message:new', {
+      conversationId,
+      message: {
+        ...newMsg,
+        poll,
+        location,
+        replyTo,
+        isOwn: false,
+        reactions: [],
+        status: 'sent',
+        sender: sanitizedSender
+      }
+    });
+
+    // Realtime conversation update broadcast to home for instant sidebar sync
+    broadcastToHome(homeId, 'conversation:updated', {
+      conversationId,
+      lastMessage: {
+        id: newMsg.id,
+        content: newMsg.content,
+        senderId: newMsg.senderId,
+        senderName: sanitizedSender.name,
+        mediaType: newMsg.mediaType,
+        createdAt: newMsg.createdAt
+      },
+      updatedAt: newMsg.createdAt
+    });
+
     res.status(201).json({
       message: {
         ...newMsg,
         poll,
         location,
+        replyTo,
         isOwn: true,
         reactions: [],
         status: 'sent',
-        sender: sanitizeUser(req.user!)
+        sender: sanitizedSender
       }
     });
   } catch (err) {
@@ -1196,7 +1373,7 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages', requireA
 
 apiRouter.patch('/homes/:homeId/conversations/:conversationId/messages/:messageId', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const { homeId, messageId } = req.params;
+    const { homeId, conversationId, messageId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
     const { content } = req.body;
@@ -1211,7 +1388,19 @@ apiRouter.patch('/homes/:homeId/conversations/:conversationId/messages/:messageI
       return;
     }
 
-    res.json({ success: true, messageId, content: content.trim() });
+    const trimmed = content.trim();
+    const nowIso = new Date().toISOString();
+
+    // Broadcast message edit to conversation
+    broadcastToConversation(conversationId, 'message:edited', {
+      conversationId,
+      messageId,
+      content: trimmed,
+      isEdited: true,
+      editedAt: nowIso
+    });
+
+    res.json({ success: true, messageId, content: trimmed });
   } catch (err) {
     console.error('Edit message error:', err);
     res.status(500).json({ error: 'Failed to update message' });
@@ -1220,7 +1409,7 @@ apiRouter.patch('/homes/:homeId/conversations/:conversationId/messages/:messageI
 
 apiRouter.delete('/homes/:homeId/conversations/:conversationId/messages/:messageId', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const { homeId, messageId } = req.params;
+    const { homeId, conversationId, messageId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
     const deleted = await deleteMessage(messageId, req.user!.id, homeId);
@@ -1228,6 +1417,12 @@ apiRouter.delete('/homes/:homeId/conversations/:conversationId/messages/:message
       res.status(403).json({ error: 'Message not found or you are not authorized to delete this message' });
       return;
     }
+
+    // Broadcast message deletion to conversation
+    broadcastToConversation(conversationId, 'message:deleted', {
+      conversationId,
+      messageId
+    });
 
     res.json({ success: true, messageId });
   } catch (err) {
@@ -1238,7 +1433,7 @@ apiRouter.delete('/homes/:homeId/conversations/:conversationId/messages/:message
 
 apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId/reactions', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const { homeId, messageId } = req.params;
+    const { homeId, conversationId, messageId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
     const { emoji } = req.body;
@@ -1248,6 +1443,14 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId
     }
 
     const reactions = await toggleMessageReaction(messageId, req.user!.id, emoji);
+
+    // Broadcast reaction change to conversation
+    broadcastToConversation(conversationId, 'message:reaction', {
+      conversationId,
+      messageId,
+      reactions
+    });
+
     res.json({ success: true, messageId, reactions });
   } catch (err) {
     console.error('Toggle reaction error:', err);
@@ -1257,7 +1460,7 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId
 
 apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId/pin', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const { homeId, messageId } = req.params;
+    const { homeId, conversationId, messageId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
     const result = await togglePinMessage(messageId, homeId, req.user!.id);
@@ -1265,6 +1468,15 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId
       res.status(404).json({ error: 'Message not found' });
       return;
     }
+
+    // Broadcast pin status change to conversation
+    broadcastToConversation(conversationId, 'message:pin', {
+      conversationId,
+      messageId,
+      isPinned: result.isPinned,
+      pinnedAt: result.pinnedAt,
+      pinnedBy: result.pinnedBy
+    });
 
     res.json({ success: true, ...result });
   } catch (err) {
@@ -1304,7 +1516,7 @@ apiRouter.get('/homes/:homeId/conversations/:conversationId/search', requireAuth
 
 apiRouter.post('/homes/:homeId/conversations/:conversationId/poll-vote', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const { homeId } = req.params;
+    const { homeId, conversationId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
     const { messageId, optionId } = req.body;
@@ -1318,6 +1530,13 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/poll-vote', require
       res.status(404).json({ error: 'Poll not found or invalid' });
       return;
     }
+
+    // Broadcast poll update to conversation
+    broadcastToConversation(conversationId, 'message:poll_vote', {
+      conversationId,
+      messageId,
+      poll
+    });
 
     res.json({ success: true, poll });
   } catch (err) {
@@ -1333,6 +1552,20 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/heartbeat', require
 
     const { isTyping } = req.body;
     const result = await updateUserHeartbeat(req.user!.id, conversationId, !!isTyping);
+
+    // Broadcast typing indicator update to conversation
+    broadcastToConversation(
+      conversationId,
+      'typing:update',
+      {
+        conversationId,
+        userId: req.user!.id,
+        userName: req.user!.name,
+        isTyping: !!isTyping
+      },
+      req.user!.id
+    );
+
     res.json(result);
   } catch (err) {
     console.error('Heartbeat error:', err);
@@ -1387,7 +1620,7 @@ apiRouter.post('/homes/:homeId/events', requireAuth, async (req: AuthRequest, re
     const { homeId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const { title, description, date, time, endTime, location, reminder, attendeeIds } = req.body;
+    const { title, description, date, time, endTime, location, reminder, attendeeIds, clientEventId } = req.body;
     if (!title || !title.trim()) {
       res.status(400).json({ error: 'Event title is required' });
       return;
@@ -1397,6 +1630,14 @@ apiRouter.post('/homes/:homeId/events', requireAuth, async (req: AuthRequest, re
       return;
     }
 
+    if (clientEventId) {
+      const existing = await getEventById(clientEventId, req.user!.id);
+      if (existing) {
+        res.status(200).json({ event: existing });
+        return;
+      }
+    }
+
     // End time validation: if end time is given and same day, verify order
     if (endTime && time && endTime < time) {
       res.status(400).json({ error: 'End time must be after start time' });
@@ -1404,7 +1645,7 @@ apiRouter.post('/homes/:homeId/events', requireAuth, async (req: AuthRequest, re
     }
 
     const newEvent: FamilyEvent = {
-      id: `ev_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+      id: clientEventId || `ev_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
       homeId,
       creatorId: req.user!.id,
       title: title.trim(),
@@ -2019,7 +2260,7 @@ apiRouter.delete('/homes/:homeId/memories/:memoryId/comments/:commentId', requir
 });
 
 // -------------------------------------------------------------
-// VAULT / SHARED FILES
+// VAULT / ENCRYPTED FAMILY FILES & SECRETS
 // -------------------------------------------------------------
 
 apiRouter.get('/homes/:homeId/vault', requireAuth, async (req: AuthRequest, res: Response) => {
@@ -2027,7 +2268,10 @@ apiRouter.get('/homes/:homeId/vault', requireAuth, async (req: AuthRequest, res:
     const { homeId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const files = await getVaultFiles(homeId);
+    const category = typeof req.query.category === 'string' ? req.query.category : undefined;
+    const search = typeof req.query.search === 'string' ? req.query.search : undefined;
+
+    const files = await getVaultFiles(homeId, category, search);
     res.json({ files });
   } catch (err) {
     console.error('Get vault error:', err);
@@ -2040,30 +2284,341 @@ apiRouter.post('/homes/:homeId/vault', requireAuth, async (req: AuthRequest, res
     const { homeId } = req.params;
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
-    const { title, category, description, contentOrUrl } = req.body;
-    if (!title || !contentOrUrl) {
-      res.status(400).json({ error: 'Title and content/link are required' });
+    const {
+      title,
+      category,
+      description,
+      contentOrUrl,
+      itemType,
+      fileBase64,
+      fileName,
+      mimeType
+    } = req.body;
+
+    if (!title || typeof title !== 'string' || !title.trim()) {
+      res.status(400).json({ error: 'A title is required for vault items' });
       return;
     }
 
-    const validCategory = ['documents', 'health', 'home', 'recipes', 'other'].includes(category) ? category : 'documents';
+    const validCategories = ['documents', 'health', 'home', 'recipes', 'financial', 'other'];
+    const validCategory = validCategories.includes(category) ? category : 'documents';
+    const isFileUpload = itemType === 'file' || (fileBase64 && typeof fileBase64 === 'string');
+    const newId = `vf_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 
-    const newFile: VaultFile = {
-      id: `vf_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-      homeId,
-      uploaderId: req.user!.id,
-      title: title.trim(),
-      category: validCategory,
-      description: description ? description.trim() : '',
-      contentOrUrl: contentOrUrl.trim(),
-      createdAt: new Date().toISOString()
-    };
+    if (isFileUpload) {
+      if (!fileBase64 || typeof fileBase64 !== 'string') {
+        res.status(400).json({ error: 'File data payload is required' });
+        return;
+      }
 
-    await createVaultFile(newFile);
-    res.status(201).json({ file: newFile });
+      // Strip potential data URL prefix
+      const cleanBase64 = fileBase64.replace(/^data:.*?;base64,/, '');
+      const buffer = Buffer.from(cleanBase64, 'base64');
+
+      // Enforce 20MB file size limit
+      const MAX_VAULT_BYTES = 20 * 1024 * 1024;
+      if (buffer.length > MAX_VAULT_BYTES) {
+        res.status(413).json({ error: 'File exceeds the 20MB vault size limit' });
+        return;
+      }
+
+      if (buffer.length === 0) {
+        res.status(400).json({ error: 'Uploaded file is empty' });
+        return;
+      }
+
+      // Sanitize client-provided filename and generate unguessable disk filename
+      const safeRawName = path.basename(fileName || 'document.bin').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 120);
+      const safeFileName = safeRawName || 'document.bin';
+      const diskFileName = `venc_${newId}_${crypto.randomBytes(8).toString('hex')}.enc`;
+      const diskPath = path.join(VAULT_STORAGE_DIR, diskFileName);
+
+      // Encrypt file at rest using AES-256-GCM
+      const { encrypted, iv, authTag } = encryptBuffer(buffer);
+
+      // Write encrypted buffer to private vault storage
+      await fs.promises.writeFile(diskPath, encrypted);
+
+      const newFile: VaultFile = {
+        id: newId,
+        homeId,
+        uploaderId: req.user!.id,
+        title: title.trim(),
+        category: validCategory as any,
+        description: description ? description.trim() : '',
+        contentOrUrl: `/api/homes/${homeId}/vault/${newId}/download`,
+        itemType: 'file',
+        fileName: safeFileName,
+        fileSize: buffer.length,
+        mimeType: mimeType || 'application/octet-stream',
+        storagePath: diskFileName,
+        isEncrypted: true,
+        iv,
+        authTag,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        uploader: {
+          id: req.user!.id,
+          name: req.user!.name,
+          email: req.user!.email,
+          avatar: req.user!.avatar
+        }
+      };
+
+      await createVaultFile(newFile);
+      res.status(201).json({ file: newFile });
+    } else {
+      // Secure Note / Code / Password
+      if (!contentOrUrl || typeof contentOrUrl !== 'string' || !contentOrUrl.trim()) {
+        res.status(400).json({ error: 'Secret note content, passcode, or code is required' });
+        return;
+      }
+
+      const noteText = contentOrUrl.trim();
+      const enc = encryptText(noteText);
+
+      const newFile: VaultFile = {
+        id: newId,
+        homeId,
+        uploaderId: req.user!.id,
+        title: title.trim(),
+        category: validCategory as any,
+        description: description ? description.trim() : '',
+        contentOrUrl: enc.encryptedHex,
+        itemType: 'note',
+        isEncrypted: true,
+        iv: enc.iv,
+        authTag: enc.authTag,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        uploader: {
+          id: req.user!.id,
+          name: req.user!.name,
+          email: req.user!.email,
+          avatar: req.user!.avatar
+        }
+      };
+
+      await createVaultFile(newFile);
+      // Return with decrypted content for caller's immediate state
+      res.status(201).json({
+        file: {
+          ...newFile,
+          contentOrUrl: noteText
+        }
+      });
+    }
   } catch (err) {
     console.error('Create vault file error:', err);
     res.status(500).json({ error: 'Failed to save vault item' });
+  }
+});
+
+// Download / View Encrypted Vault File
+apiRouter.get('/homes/:homeId/vault/:fileId/download', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, fileId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const file = await getVaultFileById(homeId, fileId);
+    if (!file || file.itemType !== 'file' || !file.storagePath) {
+      res.status(404).json({ error: 'Vault file not found' });
+      return;
+    }
+
+    // Path traversal safety check
+    const safeDiskName = path.basename(file.storagePath);
+    const diskPath = path.resolve(VAULT_STORAGE_DIR, safeDiskName);
+    if (!diskPath.startsWith(VAULT_STORAGE_DIR) || !fs.existsSync(diskPath)) {
+      res.status(404).json({ error: 'Stored vault file is missing or corrupted' });
+      return;
+    }
+
+    const encryptedData = await fs.promises.readFile(diskPath);
+    let decryptedData: Buffer;
+
+    if (file.isEncrypted && file.iv && file.authTag) {
+      try {
+        decryptedData = decryptBuffer(encryptedData, file.iv, file.authTag);
+      } catch (decErr) {
+        console.error('Decryption authentication failure for vault file:', decErr);
+        res.status(500).json({ error: 'File integrity check failed or corrupted ciphertext' });
+        return;
+      }
+    } else {
+      decryptedData = encryptedData;
+    }
+
+    const isInline = req.query.view === 'inline';
+    const safeDownloadName = (file.fileName || 'vault_document').replace(/["\r\n\\]/g, '_');
+
+    // Strict security headers for sensitive downloaded/viewed files
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `${isInline ? 'inline' : 'attachment'}; filename="${safeDownloadName}"; filename*=UTF-8''${encodeURIComponent(safeDownloadName)}`
+    );
+
+    res.send(decryptedData);
+  } catch (err) {
+    console.error('Vault download error:', err);
+    res.status(500).json({ error: 'Failed to retrieve vault file' });
+  }
+});
+
+// Inline Preview for Encrypted Vault File
+apiRouter.get('/homes/:homeId/vault/:fileId/preview', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, fileId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const file = await getVaultFileById(homeId, fileId);
+    if (!file || file.itemType !== 'file' || !file.storagePath) {
+      res.status(404).json({ error: 'Vault file not found' });
+      return;
+    }
+
+    const safeDiskName = path.basename(file.storagePath);
+    const diskPath = path.resolve(VAULT_STORAGE_DIR, safeDiskName);
+    if (!diskPath.startsWith(VAULT_STORAGE_DIR) || !fs.existsSync(diskPath)) {
+      res.status(404).json({ error: 'Stored vault file is missing' });
+      return;
+    }
+
+    const encryptedData = await fs.promises.readFile(diskPath);
+    let decryptedData: Buffer;
+
+    if (file.isEncrypted && file.iv && file.authTag) {
+      try {
+        decryptedData = decryptBuffer(encryptedData, file.iv, file.authTag);
+      } catch (decErr) {
+        console.error('Decryption failed for preview:', decErr);
+        res.status(500).json({ error: 'File decryption error' });
+        return;
+      }
+    } else {
+      decryptedData = encryptedData;
+    }
+
+    const safeDownloadName = (file.fileName || 'vault_document').replace(/["\r\n\\]/g, '_');
+
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'private, no-cache, no-store, must-revalidate');
+    res.setHeader('Content-Type', file.mimeType || 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${safeDownloadName}"; filename*=UTF-8''${encodeURIComponent(safeDownloadName)}`
+    );
+
+    res.send(decryptedData);
+  } catch (err) {
+    console.error('Vault preview error:', err);
+    res.status(500).json({ error: 'Failed to preview vault file' });
+  }
+});
+
+// Update Vault Item Metadata / Note Content
+apiRouter.put('/homes/:homeId/vault/:fileId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, fileId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const existing = await getVaultFileById(homeId, fileId);
+    if (!existing) {
+      res.status(404).json({ error: 'Vault item not found' });
+      return;
+    }
+
+    // Permission check: only uploader or home admin/owner can edit
+    const userRole = await getUserRoleInHome(req.user!.id, homeId);
+    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+    const isUploader = existing.uploaderId === req.user!.id;
+
+    if (!isOwnerOrAdmin && !isUploader) {
+      res.status(403).json({ error: 'You do not have permission to edit this vault item' });
+      return;
+    }
+
+    const { title, category, description, contentOrUrl } = req.body;
+    const updates: Partial<VaultFile> = {};
+
+    if (title && typeof title === 'string' && title.trim()) {
+      updates.title = title.trim();
+    }
+
+    if (category) {
+      const validCategories = ['documents', 'health', 'home', 'recipes', 'financial', 'other'];
+      if (validCategories.includes(category)) {
+        updates.category = category as any;
+      }
+    }
+
+    if (description !== undefined) {
+      updates.description = typeof description === 'string' ? description.trim() : '';
+    }
+
+    // If it's a note and content is being updated, re-encrypt
+    if (existing.itemType === 'note' && contentOrUrl && typeof contentOrUrl === 'string' && contentOrUrl.trim()) {
+      const enc = encryptText(contentOrUrl.trim());
+      updates.contentOrUrl = enc.encryptedHex;
+      updates.iv = enc.iv;
+      updates.authTag = enc.authTag;
+      updates.isEncrypted = true;
+    }
+
+    const updated = await updateVaultFile(homeId, fileId, updates);
+    res.json({ file: updated });
+  } catch (err) {
+    console.error('Update vault error:', err);
+    res.status(500).json({ error: 'Failed to update vault item' });
+  }
+});
+
+// Delete Vault File / Note (with disk cleanup)
+apiRouter.delete('/homes/:homeId/vault/:fileId', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { homeId, fileId } = req.params;
+    if (!(await requireHomeMembership(req, res, homeId))) return;
+
+    const existing = await getVaultFileById(homeId, fileId);
+    if (!existing) {
+      res.status(404).json({ error: 'Vault item not found' });
+      return;
+    }
+
+    // Permission check: only uploader or home admin/owner can delete
+    const userRole = await getUserRoleInHome(req.user!.id, homeId);
+    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+    const isUploader = existing.uploaderId === req.user!.id;
+
+    if (!isOwnerOrAdmin && !isUploader) {
+      res.status(403).json({ error: 'You do not have permission to delete this vault item' });
+      return;
+    }
+
+    // Delete record from database
+    await deleteVaultFile(homeId, fileId);
+
+    // Clean up encrypted physical file on disk if it was a file item
+    if (existing.itemType === 'file' && existing.storagePath) {
+      const safeDiskName = path.basename(existing.storagePath);
+      const diskPath = path.resolve(VAULT_STORAGE_DIR, safeDiskName);
+      if (diskPath.startsWith(VAULT_STORAGE_DIR) && fs.existsSync(diskPath)) {
+        await fs.promises.unlink(diskPath).catch(unlinkErr => {
+          console.warn('Warning: Could not remove disk vault file:', unlinkErr);
+        });
+      }
+    }
+
+    res.json({ success: true, message: 'Vault item securely deleted' });
+  } catch (err) {
+    console.error('Delete vault error:', err);
+    res.status(500).json({ error: 'Failed to delete vault item' });
   }
 });
 
@@ -2186,6 +2741,108 @@ apiRouter.put('/notifications/preferences', requireAuth, async (req: AuthRequest
   } catch (err) {
     console.error('Update notification preferences error:', err);
     res.status(500).json({ error: 'Failed to update notification preferences' });
+  }
+});
+
+// -------------------------------------------------------------
+// PUSH NOTIFICATIONS & DEVICE MANAGEMENT
+// -------------------------------------------------------------
+
+// 1. Get VAPID public key for Web Push client subscription
+apiRouter.get('/push/vapid-public-key', (req: Request, res: Response) => {
+  try {
+    const publicKey = getVapidPublicKey();
+    res.json({ publicKey });
+  } catch (err) {
+    console.error('Failed to get VAPID public key:', err);
+    res.status(500).json({ error: 'Failed to retrieve push public key' });
+  }
+});
+
+// 2. Get registered push devices for current user
+apiRouter.get('/push/devices', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const devices = await getUserPushSubscriptions(req.user!.id);
+    res.json({ devices });
+  } catch (err) {
+    console.error('Failed to get user push devices:', err);
+    res.status(500).json({ error: 'Failed to retrieve devices' });
+  }
+});
+
+// 3. Register or update a device push subscription
+apiRouter.post('/push/subscribe', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { endpoint, keys, deviceLabel, platform } = req.body || {};
+
+    if (!endpoint || typeof endpoint !== 'string') {
+      return res.status(400).json({ error: 'Valid push endpoint is required' });
+    }
+
+    if (!keys || typeof keys.p256dh !== 'string' || typeof keys.auth !== 'string') {
+      return res.status(400).json({ error: 'Subscription keys (p256dh and auth) are required' });
+    }
+
+    // Register subscription strictly scoped to authenticated user
+    const subscription = await savePushSubscription(req.user!.id, {
+      endpoint,
+      keys: {
+        p256dh: keys.p256dh,
+        auth: keys.auth
+      },
+      deviceLabel: typeof deviceLabel === 'string' ? deviceLabel.trim().slice(0, 60) : undefined,
+      platform: platform === 'android' ? 'android' : 'web_push'
+    });
+
+    // Ensure user notification preferences has browserPush set to true
+    const currentPrefs = await getUserNotificationPreferences(req.user!.id);
+    if (!currentPrefs.browserPush) {
+      await updateUserNotificationPreferences(req.user!.id, { browserPush: true });
+    }
+
+    res.json({ success: true, device: subscription });
+  } catch (err) {
+    console.error('Push subscription registration error:', err);
+    res.status(500).json({ error: 'Failed to register push device' });
+  }
+});
+
+// 4. Unregister a device push subscription by ID
+apiRouter.delete('/push/devices/:id', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const success = await deletePushSubscription(id, req.user!.id);
+    res.json({ success });
+  } catch (err) {
+    console.error('Delete push device error:', err);
+    res.status(500).json({ error: 'Failed to delete push device' });
+  }
+});
+
+// 5. Unregister device push subscription by endpoint
+apiRouter.post('/push/unsubscribe', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { endpoint } = req.body || {};
+    if (!endpoint || typeof endpoint !== 'string') {
+      return res.status(400).json({ error: 'endpoint is required' });
+    }
+    await deletePushSubscriptionByEndpoint(endpoint);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Push unsubscribe error:', err);
+    res.status(500).json({ error: 'Failed to unsubscribe push device' });
+  }
+});
+
+// 6. Test push notification delivery on user's registered devices
+apiRouter.post('/push/test', requireAuth, async (req: AuthRequest, res: Response) => {
+  try {
+    const { deviceLabel } = req.body || {};
+    const result = await sendTestPushToUser(req.user!.id, deviceLabel);
+    res.json(result);
+  } catch (err) {
+    console.error('Push test error:', err);
+    res.status(500).json({ error: 'Failed to send test push' });
   }
 });
 

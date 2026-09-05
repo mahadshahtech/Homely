@@ -10,6 +10,8 @@ import type {
   VaultFile,
   NotificationItem,
   NotificationPreferences,
+  PushDeviceSubscription,
+  PushSubscriptionRegistrationPayload,
   AskHomelyMessage,
   AskHomelyActionPending,
   AskHomelyResponse,
@@ -187,15 +189,31 @@ export const api = {
     }>(`/homes/${homeId}/dashboard`);
   },
 
+  async getHomeSync(homeId: string, since?: string) {
+    const q = since ? `?since=${encodeURIComponent(since)}` : '';
+    return request<{
+      homeId: string;
+      serverTime: string;
+      dashboard: any;
+      conversations: Conversation[];
+    }>(`/homes/${homeId}/sync${q}`);
+  },
+
   // Feed & Posts
   async getPosts(homeId: string) {
     return request<{ posts: Post[] }>(`/homes/${homeId}/posts`);
   },
 
-  async createPost(homeId: string, content: string, type: 'update' | 'photo' | 'announcement' | 'memory', imageUrl?: string) {
+  async createPost(
+    homeId: string,
+    content: string,
+    type: 'update' | 'photo' | 'announcement' | 'memory',
+    imageUrl?: string,
+    clientPostId?: string
+  ) {
     return request<{ post: Post }>(`/homes/${homeId}/posts`, {
       method: 'POST',
-      body: JSON.stringify({ content, type, imageUrl })
+      body: JSON.stringify({ content, type, imageUrl, clientPostId })
     });
   },
 
@@ -206,10 +224,10 @@ export const api = {
     });
   },
 
-  async addComment(homeId: string, postId: string, content: string) {
+  async addComment(homeId: string, postId: string, content: string, clientCommentId?: string) {
     return request<{ comment: any }>(`/homes/${homeId}/posts/${postId}/comments`, {
       method: 'POST',
-      body: JSON.stringify({ content })
+      body: JSON.stringify({ content, clientCommentId })
     });
   },
 
@@ -248,6 +266,7 @@ export const api = {
       mediaDuration?: number;
       extraData?: string | object;
       isPinned?: boolean;
+      clientMessageId?: string;
     }
   ) {
     return request<{ message: Message }>(`/homes/${homeId}/conversations/${conversationId}/messages`, {
@@ -380,6 +399,7 @@ export const api = {
       location?: string;
       reminder?: string;
       attendeeIds?: string[];
+      clientEventId?: string;
     }
   ) {
     return request<{ event: FamilyEvent }>(`/homes/${homeId}/events`, {
@@ -538,15 +558,90 @@ export const api = {
   },
 
   // Vault
-  async getVaultFiles(homeId: string) {
-    return request<{ files: VaultFile[] }>(`/homes/${homeId}/vault`);
+  async getVaultFiles(homeId: string, category?: string, search?: string) {
+    const params = new URLSearchParams();
+    if (category && category !== 'all') params.append('category', category);
+    if (search && search.trim()) params.append('search', search.trim());
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return request<{ files: VaultFile[] }>(`/homes/${homeId}/vault${qs}`);
   },
 
-  async createVaultFile(homeId: string, data: { title: string; category: string; description?: string; contentOrUrl: string }) {
+  async createVaultFile(
+    homeId: string,
+    data: {
+      title: string;
+      category: string;
+      description?: string;
+      contentOrUrl?: string;
+      itemType?: 'note' | 'file';
+      fileName?: string;
+      fileBase64?: string;
+      mimeType?: string;
+    }
+  ) {
     return request<{ file: VaultFile }>(`/homes/${homeId}/vault`, {
       method: 'POST',
       body: JSON.stringify(data)
     });
+  },
+
+  async updateVaultFile(
+    homeId: string,
+    fileId: string,
+    data: {
+      title?: string;
+      category?: string;
+      description?: string;
+      contentOrUrl?: string;
+    }
+  ) {
+    return request<{ file: VaultFile }>(`/homes/${homeId}/vault/${fileId}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+  },
+
+  async deleteVaultFile(homeId: string, fileId: string) {
+    return request<{ success: boolean; message: string }>(`/homes/${homeId}/vault/${fileId}`, {
+      method: 'DELETE'
+    });
+  },
+
+  // Securely download or preview vault file using authenticated header
+  async fetchVaultFileBlob(
+    homeId: string,
+    fileId: string,
+    inline: boolean = false
+  ): Promise<{ blob: Blob; fileName: string; mimeType: string }> {
+    const token = getStoredToken();
+    const url = `/api/homes/${homeId}/vault/${fileId}/download${inline ? '?view=inline' : ''}`;
+    const res = await fetch(url, {
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      }
+    });
+
+    if (!res.ok) {
+      let msg = 'Failed to download vault file';
+      try {
+        const errJson = await res.json();
+        if (errJson.error) msg = errJson.error;
+      } catch {
+        // fallback
+      }
+      throw new Error(msg);
+    }
+
+    const blob = await res.blob();
+    const disposition = res.headers.get('content-disposition') || '';
+    let fileName = 'vault_file';
+    const match = disposition.match(/filename\*?=(?:UTF-8'')?([^;]+)/i);
+    if (match && match[1]) {
+      fileName = decodeURIComponent(match[1].replace(/["']/g, ''));
+    }
+    const mimeType = res.headers.get('content-type') || blob.type || 'application/octet-stream';
+
+    return { blob, fileName, mimeType };
   },
 
   // Notifications
@@ -590,6 +685,42 @@ export const api = {
     return request<{ preferences: NotificationPreferences }>('/notifications/preferences', {
       method: 'PUT',
       body: JSON.stringify(preferences)
+    });
+  },
+
+  // Push Notification Device Management
+  async getPushVapidPublicKey() {
+    return request<{ publicKey: string }>('/push/vapid-public-key');
+  },
+
+  async getPushDevices() {
+    return request<{ devices: PushDeviceSubscription[] }>('/push/devices');
+  },
+
+  async registerPushDevice(payload: PushSubscriptionRegistrationPayload) {
+    return request<{ success: boolean; device: PushDeviceSubscription }>('/push/subscribe', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async deletePushDevice(id: string) {
+    return request<{ success: boolean }>(`/push/devices/${encodeURIComponent(id)}`, {
+      method: 'DELETE'
+    });
+  },
+
+  async unsubscribePushDevice(endpoint: string) {
+    return request<{ success: boolean }>('/push/unsubscribe', {
+      method: 'POST',
+      body: JSON.stringify({ endpoint })
+    });
+  },
+
+  async sendTestPush(deviceLabel?: string) {
+    return request<{ success: boolean; sent: number; totalDevices: number; message: string }>('/push/test', {
+      method: 'POST',
+      body: JSON.stringify({ deviceLabel })
     });
   },
 

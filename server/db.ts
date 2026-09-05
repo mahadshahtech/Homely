@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { createClient, type Client } from '@libsql/client';
+import { decryptText } from './vaultCrypto.ts';
 import type {
   User,
   Session,
@@ -22,6 +23,8 @@ import type {
   NotificationItem,
   NotificationType,
   NotificationPreferences,
+  PushDeviceSubscription,
+  PushSubscriptionRegistrationPayload,
   UserRole,
   AssistantMemory,
   AskHomelyMessage,
@@ -252,7 +255,16 @@ async function initDatabase(): Promise<void> {
         category TEXT NOT NULL,
         description TEXT,
         contentOrUrl TEXT NOT NULL,
+        itemType TEXT NOT NULL DEFAULT 'note',
+        fileName TEXT,
+        fileSize INTEGER DEFAULT 0,
+        mimeType TEXT,
+        storagePath TEXT,
+        isEncrypted INTEGER DEFAULT 0,
+        iv TEXT,
+        authTag TEXT,
         createdAt TEXT NOT NULL,
+        updatedAt TEXT,
         FOREIGN KEY (homeId) REFERENCES homes(id) ON DELETE CASCADE,
         FOREIGN KEY (uploaderId) REFERENCES users(id) ON DELETE CASCADE
       );
@@ -353,6 +365,22 @@ async function initDatabase(): Promise<void> {
       );
     `);
 
+    // 19. Push Device Subscriptions (multiple devices per user)
+    await sqliteClient.execute(`
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id TEXT PRIMARY KEY,
+        userId TEXT NOT NULL,
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT,
+        auth TEXT,
+        deviceLabel TEXT,
+        platform TEXT NOT NULL DEFAULT 'web_push',
+        createdAt TEXT NOT NULL,
+        lastUsedAt TEXT NOT NULL,
+        FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+      );
+    `);
+
     // Safe column additions for modern chat & notification features
     const safeAddColumn = async (table: string, colDef: string) => {
       try {
@@ -447,6 +475,28 @@ async function initDatabase(): Promise<void> {
     await sqliteClient.execute('CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(recipientId, read);');
     await sqliteClient.execute('CREATE INDEX IF NOT EXISTS idx_assistant_memories_home ON assistant_memories(homeId);');
     await sqliteClient.execute('CREATE INDEX IF NOT EXISTS idx_ask_homely_home_user ON ask_homely_messages(homeId, userId);');
+    await sqliteClient.execute('CREATE INDEX IF NOT EXISTS idx_push_user ON push_subscriptions(userId);');
+    await sqliteClient.execute('CREATE INDEX IF NOT EXISTS idx_push_endpoint ON push_subscriptions(endpoint);');
+
+    // Run schema column migrations for vault_files if existing database lacks new columns
+    const vaultCols = [
+      'ALTER TABLE vault_files ADD COLUMN itemType TEXT NOT NULL DEFAULT "note";',
+      'ALTER TABLE vault_files ADD COLUMN fileName TEXT;',
+      'ALTER TABLE vault_files ADD COLUMN fileSize INTEGER DEFAULT 0;',
+      'ALTER TABLE vault_files ADD COLUMN mimeType TEXT;',
+      'ALTER TABLE vault_files ADD COLUMN storagePath TEXT;',
+      'ALTER TABLE vault_files ADD COLUMN isEncrypted INTEGER DEFAULT 0;',
+      'ALTER TABLE vault_files ADD COLUMN iv TEXT;',
+      'ALTER TABLE vault_files ADD COLUMN authTag TEXT;',
+      'ALTER TABLE vault_files ADD COLUMN updatedAt TEXT;'
+    ];
+    for (const sql of vaultCols) {
+      try {
+        await sqliteClient.execute(sql);
+      } catch {
+        // column likely exists already
+      }
+    }
 
     // Run Migration from Legacy JSON file if database is new
     await migrateFromJsonIfEmpty();
@@ -2695,42 +2745,157 @@ export async function deleteMemoryComment(commentId: string): Promise<boolean> {
 // -------------------------------------------------------------
 // VAULT REPOSITORY
 // -------------------------------------------------------------
-export async function getVaultFiles(homeId: string) {
-  await ensureDbReady();
-  const res = await sqliteClient.execute({
-    sql: `SELECT vf.*, u.name as uploaderName, u.email as uploaderEmail, u.avatar as uploaderAvatar
-          FROM vault_files vf
-          LEFT JOIN users u ON u.id = vf.uploaderId
-          WHERE vf.homeId = ?
-          ORDER BY vf.createdAt DESC`,
-    args: [homeId]
-  });
 
-  return res.rows.map(vf => ({
+function mapVaultFileRow(vf: any): VaultFile {
+  let content = (vf.contentOrUrl as string) || '';
+  const isEncrypted = Boolean(vf.isEncrypted);
+  const itemType = (vf.itemType as 'note' | 'file') || 'note';
+
+  if (isEncrypted && itemType === 'note' && vf.iv && vf.authTag) {
+    try {
+      content = decryptText(content, vf.iv as string, vf.authTag as string);
+    } catch (e) {
+      console.warn(`Failed to decrypt vault note ${vf.id}:`, e);
+      content = '[Encrypted Content - Decryption Failed]';
+    }
+  }
+
+  return {
     id: vf.id as string,
     homeId: vf.homeId as string,
     uploaderId: vf.uploaderId as string,
     title: vf.title as string,
     category: vf.category as any,
     description: (vf.description as string) || '',
-    contentOrUrl: vf.contentOrUrl as string,
+    contentOrUrl: content,
+    itemType,
+    fileName: (vf.fileName as string) || undefined,
+    fileSize: vf.fileSize ? Number(vf.fileSize) : 0,
+    mimeType: (vf.mimeType as string) || undefined,
+    storagePath: (vf.storagePath as string) || undefined,
+    isEncrypted,
+    iv: (vf.iv as string) || undefined,
+    authTag: (vf.authTag as string) || undefined,
     createdAt: vf.createdAt as string,
+    updatedAt: (vf.updatedAt as string) || undefined,
     uploader: {
       id: vf.uploaderId as string,
       name: (vf.uploaderName as string) || 'Family Member',
       email: (vf.uploaderEmail as string) || '',
       avatar: (vf.uploaderAvatar as string) || ''
     }
-  }));
+  };
+}
+
+export async function getVaultFiles(homeId: string, category?: string, search?: string): Promise<VaultFile[]> {
+  await ensureDbReady();
+  let sql = `SELECT vf.*, u.name as uploaderName, u.email as uploaderEmail, u.avatar as uploaderAvatar
+             FROM vault_files vf
+             LEFT JOIN users u ON u.id = vf.uploaderId
+             WHERE vf.homeId = ?`;
+  const args: any[] = [homeId];
+
+  if (category && category !== 'all') {
+    sql += ' AND vf.category = ?';
+    args.push(category);
+  }
+
+  if (search && search.trim()) {
+    sql += ' AND (vf.title LIKE ? OR vf.description LIKE ? OR vf.fileName LIKE ?)';
+    const term = `%${search.trim()}%`;
+    args.push(term, term, term);
+  }
+
+  sql += ' ORDER BY vf.createdAt DESC';
+
+  const res = await sqliteClient.execute({ sql, args });
+  return res.rows.map(mapVaultFileRow);
+}
+
+export async function getVaultFileById(homeId: string, fileId: string): Promise<VaultFile | null> {
+  await ensureDbReady();
+  const res = await sqliteClient.execute({
+    sql: `SELECT vf.*, u.name as uploaderName, u.email as uploaderEmail, u.avatar as uploaderAvatar
+          FROM vault_files vf
+          LEFT JOIN users u ON u.id = vf.uploaderId
+          WHERE vf.homeId = ? AND vf.id = ? LIMIT 1`,
+    args: [homeId, fileId]
+  });
+
+  if (res.rows.length === 0) return null;
+  return mapVaultFileRow(res.rows[0]);
 }
 
 export async function createVaultFile(file: VaultFile): Promise<VaultFile> {
   await ensureDbReady();
   await sqliteClient.execute({
-    sql: 'INSERT INTO vault_files (id, homeId, uploaderId, title, category, description, contentOrUrl, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-    args: [file.id, file.homeId, file.uploaderId, file.title, file.category, file.description || '', file.contentOrUrl, file.createdAt]
+    sql: `INSERT INTO vault_files (
+            id, homeId, uploaderId, title, category, description,
+            contentOrUrl, itemType, fileName, fileSize, mimeType,
+            storagePath, isEncrypted, iv, authTag, createdAt, updatedAt
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [
+      file.id,
+      file.homeId,
+      file.uploaderId,
+      file.title,
+      file.category,
+      file.description || '',
+      file.contentOrUrl,
+      file.itemType || 'note',
+      file.fileName || null,
+      file.fileSize || 0,
+      file.mimeType || null,
+      file.storagePath || null,
+      file.isEncrypted ? 1 : 0,
+      file.iv || null,
+      file.authTag || null,
+      file.createdAt,
+      file.updatedAt || file.createdAt
+    ]
   });
   return file;
+}
+
+export async function updateVaultFile(
+  homeId: string,
+  fileId: string,
+  updates: Partial<VaultFile>
+): Promise<VaultFile | null> {
+  await ensureDbReady();
+  const existing = await getVaultFileById(homeId, fileId);
+  if (!existing) return null;
+
+  const title = updates.title !== undefined ? updates.title : existing.title;
+  const category = updates.category !== undefined ? updates.category : existing.category;
+  const description = updates.description !== undefined ? updates.description : existing.description;
+  const contentOrUrl = updates.contentOrUrl !== undefined ? updates.contentOrUrl : existing.contentOrUrl;
+  const iv = updates.iv !== undefined ? updates.iv : existing.iv;
+  const authTag = updates.authTag !== undefined ? updates.authTag : existing.authTag;
+  const isEncrypted = updates.isEncrypted !== undefined ? (updates.isEncrypted ? 1 : 0) : (existing.isEncrypted ? 1 : 0);
+  const updatedAt = new Date().toISOString();
+
+  await sqliteClient.execute({
+    sql: `UPDATE vault_files
+          SET title = ?, category = ?, description = ?, contentOrUrl = ?,
+              iv = ?, authTag = ?, isEncrypted = ?, updatedAt = ?
+          WHERE homeId = ? AND id = ?`,
+    args: [title, category, description || '', contentOrUrl, iv || null, authTag || null, isEncrypted, updatedAt, homeId, fileId]
+  });
+
+  return getVaultFileById(homeId, fileId);
+}
+
+export async function deleteVaultFile(homeId: string, fileId: string): Promise<VaultFile | null> {
+  await ensureDbReady();
+  const existing = await getVaultFileById(homeId, fileId);
+  if (!existing) return null;
+
+  await sqliteClient.execute({
+    sql: 'DELETE FROM vault_files WHERE homeId = ? AND id = ?',
+    args: [homeId, fileId]
+  });
+  return existing;
 }
 
 // -------------------------------------------------------------
@@ -3064,7 +3229,23 @@ export async function createNotification(notif: NotificationItem): Promise<Notif
     ]
   });
 
+  if (onNotificationCreatedHook) {
+    try {
+      Promise.resolve(onNotificationCreatedHook(notif)).catch(err => {
+        console.warn('[Notification Hook] Error running onNotificationCreated:', err);
+      });
+    } catch (err) {
+      console.warn('[Notification Hook] Sync error:', err);
+    }
+  }
+
   return notif;
+}
+
+type NotificationCreatedHook = (notif: NotificationItem) => void | Promise<any>;
+let onNotificationCreatedHook: NotificationCreatedHook | null = null;
+export function setOnNotificationCreated(hook: NotificationCreatedHook | null) {
+  onNotificationCreatedHook = hook;
 }
 
 export async function markNotificationAsRead(notificationId: string, recipientId: string): Promise<boolean> {
@@ -3098,6 +3279,101 @@ export async function deleteNotification(notificationId: string, recipientId: st
     args: [notificationId, recipientId]
   });
   return res.rowsAffected > 0;
+}
+
+// -------------------------------------------------------------
+// PUSH DEVICE SUBSCRIPTIONS REPOSITORY
+// -------------------------------------------------------------
+
+export async function savePushSubscription(
+  userId: string,
+  payload: PushSubscriptionRegistrationPayload
+): Promise<PushDeviceSubscription> {
+  await ensureDbReady();
+  const id = `push_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+  const now = new Date().toISOString();
+  const platform = payload.platform || 'web_push';
+  const deviceLabel = payload.deviceLabel || (platform === 'android' ? 'Android Device' : 'Web Device');
+  const p256dh = payload.keys?.p256dh || '';
+  const auth = payload.keys?.auth || '';
+
+  // Upsert on endpoint: if endpoint already exists, update it
+  await sqliteClient.execute({
+    sql: `INSERT INTO push_subscriptions (id, userId, endpoint, p256dh, auth, deviceLabel, platform, createdAt, lastUsedAt)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(endpoint) DO UPDATE SET
+            userId = excluded.userId,
+            p256dh = excluded.p256dh,
+            auth = excluded.auth,
+            deviceLabel = excluded.deviceLabel,
+            platform = excluded.platform,
+            lastUsedAt = excluded.lastUsedAt`,
+    args: [id, userId, payload.endpoint, p256dh, auth, deviceLabel, platform, now, now]
+  });
+
+  const res = await sqliteClient.execute({
+    sql: 'SELECT * FROM push_subscriptions WHERE endpoint = ? LIMIT 1',
+    args: [payload.endpoint]
+  });
+
+  const row = res.rows[0];
+  return {
+    id: row.id as string,
+    userId: row.userId as string,
+    endpoint: row.endpoint as string,
+    p256dh: (row.p256dh as string) || '',
+    auth: (row.auth as string) || '',
+    deviceLabel: (row.deviceLabel as string) || 'Registered Device',
+    platform: (row.platform as 'web_push' | 'android') || 'web_push',
+    createdAt: row.createdAt as string,
+    lastUsedAt: row.lastUsedAt as string
+  };
+}
+
+export async function getUserPushSubscriptions(userId: string): Promise<PushDeviceSubscription[]> {
+  await ensureDbReady();
+  const res = await sqliteClient.execute({
+    sql: 'SELECT * FROM push_subscriptions WHERE userId = ? ORDER BY lastUsedAt DESC',
+    args: [userId]
+  });
+
+  return res.rows.map(row => ({
+    id: row.id as string,
+    userId: row.userId as string,
+    endpoint: row.endpoint as string,
+    p256dh: (row.p256dh as string) || '',
+    auth: (row.auth as string) || '',
+    deviceLabel: (row.deviceLabel as string) || 'Registered Device',
+    platform: (row.platform as 'web_push' | 'android') || 'web_push',
+    createdAt: row.createdAt as string,
+    lastUsedAt: row.lastUsedAt as string
+  }));
+}
+
+export async function deletePushSubscription(id: string, userId: string): Promise<boolean> {
+  await ensureDbReady();
+  const res = await sqliteClient.execute({
+    sql: 'DELETE FROM push_subscriptions WHERE id = ? AND userId = ?',
+    args: [id, userId]
+  });
+  return res.rowsAffected > 0;
+}
+
+export async function deletePushSubscriptionByEndpoint(endpoint: string): Promise<boolean> {
+  await ensureDbReady();
+  const res = await sqliteClient.execute({
+    sql: 'DELETE FROM push_subscriptions WHERE endpoint = ?',
+    args: [endpoint]
+  });
+  return res.rowsAffected > 0;
+}
+
+export async function updatePushSubscriptionLastUsed(endpoint: string): Promise<void> {
+  await ensureDbReady();
+  await sqliteClient.execute({
+    sql: 'UPDATE push_subscriptions SET lastUsedAt = ? WHERE endpoint = ?',
+    args: [new Date().toISOString(), endpoint]
+  });
 }
 
 // -------------------------------------------------------------
@@ -3161,12 +3437,15 @@ export async function getHomeAiContext(homeId: string) {
       title: m.title as string,
       story: m.story as string
     })),
-    vaultFiles: vaultRes.rows.map(v => ({
-      title: v.title as string,
-      category: v.category as string,
-      description: (v.description as string) || '',
-      contentOrUrl: v.contentOrUrl as string
-    }))
+    vaultFiles: vaultRes.rows.map(v => {
+      const mapped = mapVaultFileRow(v);
+      return {
+        title: mapped.title,
+        category: mapped.category,
+        description: mapped.description || '',
+        contentOrUrl: mapped.itemType === 'file' ? `[Encrypted File: ${mapped.fileName || mapped.title}]` : mapped.contentOrUrl
+      };
+    })
   };
 }
 

@@ -1,6 +1,12 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import type { User, Home, UserRole } from '../types';
 import { api, getStoredToken } from '../services/api';
+import {
+  cacheUserProfile,
+  getCachedUserProfile,
+  cacheHomeDetails,
+  getCachedHomeDetails
+} from '../services/offlineStorage';
 
 interface AuthContextType {
   user: User | null;
@@ -75,10 +81,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       } catch {
         // ignore
       }
+      if (user?.id) {
+        await cacheHomeDetails(user.id, res.home);
+      }
     } catch (err) {
-      console.warn('Failed to load active home details:', err);
+      console.warn('Failed to load active home details from network, checking cache:', err);
+      if (user?.id) {
+        const cached = await getCachedHomeDetails(user.id, homeId);
+        if (cached) {
+          setActiveHome(cached);
+          setUserRole('member');
+        }
+      }
     }
-  }, []);
+  }, [user?.id]);
 
   // Fetch homes for current user
   const refreshHomes = useCallback(async () => {
@@ -120,12 +136,38 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const res = await api.getMe();
       setUser(res.user);
+      await cacheUserProfile(res.user);
       await refreshHomes();
     } catch (err) {
-      console.warn('Auth check failed:', err);
-      setUser(null);
-      setHomes([]);
-      setActiveHome(null);
+      console.warn('Auth check network failed, trying offline cache:', err);
+      try {
+        const cached = await getCachedUserProfile();
+        if (cached) {
+          setUser(cached);
+          let savedHomeId: string | null = null;
+          try {
+            savedHomeId = localStorage.getItem(ACTIVE_HOME_KEY);
+          } catch {
+            // ignore
+          }
+          if (savedHomeId) {
+            const cachedHome = await getCachedHomeDetails(cached.id, savedHomeId);
+            if (cachedHome) {
+              setActiveHome(cachedHome);
+              setUserRole('member');
+              setHomes([cachedHome]);
+            }
+          }
+        } else {
+          setUser(null);
+          setHomes([]);
+          setActiveHome(null);
+        }
+      } catch {
+        setUser(null);
+        setHomes([]);
+        setActiveHome(null);
+      }
     } finally {
       setLoading(false);
     }

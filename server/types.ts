@@ -210,10 +210,25 @@ export interface VaultFile {
   homeId: string;
   uploaderId: string;
   title: string;
-  category: 'documents' | 'health' | 'home' | 'recipes' | 'other';
+  category: 'documents' | 'health' | 'home' | 'recipes' | 'financial' | 'other';
   description?: string;
   contentOrUrl: string;
+  itemType?: 'note' | 'file';
+  fileName?: string;
+  fileSize?: number;
+  mimeType?: string;
+  storagePath?: string;
+  isEncrypted?: boolean;
+  iv?: string;
+  authTag?: string;
   createdAt: string;
+  updatedAt?: string;
+  uploader?: {
+    id: string;
+    name: string;
+    email?: string;
+    avatar?: string;
+  };
 }
 
 export type NotificationType =
@@ -276,6 +291,28 @@ export interface NotificationPreferences {
   askHomely: boolean;
   browserPush: boolean;
   updatedAt?: string;
+}
+
+export interface PushDeviceSubscription {
+  id: string;
+  userId: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  deviceLabel: string;
+  platform: 'web_push' | 'android';
+  createdAt: string;
+  lastUsedAt: string;
+}
+
+export interface PushSubscriptionRegistrationPayload {
+  endpoint: string;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+  deviceLabel?: string;
+  platform?: 'web_push' | 'android';
 }
 
 export interface AssistantMemory {

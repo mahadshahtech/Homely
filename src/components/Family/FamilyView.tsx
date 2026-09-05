@@ -21,6 +21,7 @@ import { api } from '../../services/api';
 import type { HomeMember, FamilyEvent, FamilyMemory, VaultFile } from '../../types';
 import { MemoriesView } from './Memories/MemoriesView';
 import { EventsView } from './Events/EventsView';
+import { VaultView } from './Vault/VaultView';
 
 type FamilySubTab = 'members' | 'events' | 'memories' | 'vault';
 
@@ -41,15 +42,6 @@ export const FamilyView: React.FC<FamilyViewProps> = ({ initialSubTab = 'members
   // Members state
   const [members, setMembers] = useState<HomeMember[]>([]);
   const [copiedCode, setCopiedCode] = useState(false);
-
-  // Vault state
-  const [vaultFiles, setVaultFiles] = useState<VaultFile[]>([]);
-  const [showAddVault, setShowAddVault] = useState(false);
-  const [vaultTitle, setVaultTitle] = useState('');
-  const [vaultCategory, setVaultCategory] = useState<'documents' | 'health' | 'home' | 'recipes' | 'other'>('home');
-  const [vaultContent, setVaultContent] = useState('');
-  const [vaultDesc, setVaultDesc] = useState('');
-
   const [loading, setLoading] = useState(false);
 
   // Load section data
@@ -60,9 +52,6 @@ export const FamilyView: React.FC<FamilyViewProps> = ({ initialSubTab = 'members
       if (subTab === 'members') {
         const res = await api.getHomeMembers(activeHome.id);
         setMembers(res.members);
-      } else if (subTab === 'vault') {
-        const res = await api.getVaultFiles(activeHome.id);
-        setVaultFiles(res.files);
       }
     } catch (err) {
       console.warn('Error loading family section:', err);
@@ -85,28 +74,6 @@ export const FamilyView: React.FC<FamilyViewProps> = ({ initialSubTab = 'members
     navigator.clipboard.writeText(activeHome.inviteCode);
     setCopiedCode(true);
     setTimeout(() => setCopiedCode(false), 2000);
-  };
-
-  // Vault handlers
-  const handleCreateVault = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!activeHome || !vaultTitle.trim() || !vaultContent.trim()) return;
-
-    try {
-      await api.createVaultFile(activeHome.id, {
-        title: vaultTitle.trim(),
-        category: vaultCategory,
-        contentOrUrl: vaultContent.trim(),
-        description: vaultDesc.trim() || undefined
-      });
-      setShowAddVault(false);
-      setVaultTitle('');
-      setVaultContent('');
-      setVaultDesc('');
-      loadData();
-    } catch (err: any) {
-      alert(err.message || 'Could not save vault file');
-    }
   };
 
   return (
@@ -258,159 +225,12 @@ export const FamilyView: React.FC<FamilyViewProps> = ({ initialSubTab = 'members
 
       {/* ----------------- VAULT TAB ----------------- */}
       {subTab === 'vault' && (
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h3 className="text-sm font-bold text-stone-900 dark:text-stone-100">
-                Secure Family Vault
-              </h3>
-              <p className="text-xs text-stone-500 dark:text-stone-400">
-                Encrypted notes for WiFi, spare keys, emergency docs, recipes
-              </p>
-            </div>
-            <button
-              id="btn-add-vault-file"
-              onClick={() => setShowAddVault(true)}
-              className="flex items-center space-x-1 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold transition-colors shadow-sm shrink-0"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span>Add Note / Code</span>
-            </button>
-          </div>
-
-          {vaultFiles.length === 0 ? (
-            <div className="bg-white dark:bg-zinc-900 border border-stone-200/80 dark:border-zinc-800 rounded-3xl p-8 text-center space-y-2">
-              <FolderLock className="w-10 h-10 text-stone-300 dark:text-zinc-700 mx-auto" />
-              <h4 className="font-bold text-stone-900 dark:text-stone-100 text-sm">Vault is empty</h4>
-              <p className="text-xs text-stone-400 max-w-xs mx-auto">
-                Safely store details like "Spare key is under the blue pot" or "Home WiFi credentials".
-              </p>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {vaultFiles.map(vf => (
-                <div
-                  key={vf.id}
-                  className="bg-white dark:bg-zinc-900 border border-stone-200/80 dark:border-zinc-800 rounded-3xl p-4 sm:p-5 shadow-sm space-y-2 transition-colors"
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center space-x-2">
-                      <div className="p-2 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-400">
-                        <KeyRound className="w-4 h-4" />
-                      </div>
-                      <div>
-                        <h4 className="font-bold text-sm text-stone-900 dark:text-stone-100">
-                          {vf.title}
-                        </h4>
-                        <span className="text-[10px] uppercase font-semibold text-stone-400 tracking-wider">
-                          {vf.category}
-                        </span>
-                      </div>
-                    </div>
-                    <span className="text-[10px] text-stone-400">Added by {vf.uploader.name}</span>
-                  </div>
-
-                  {vf.description && (
-                    <p className="text-xs text-stone-600 dark:text-stone-300">
-                      {vf.description}
-                    </p>
-                  )}
-
-                  <div className="bg-stone-50 dark:bg-zinc-800/60 border border-stone-200/60 dark:border-zinc-700/60 p-3 rounded-2xl flex items-center justify-between">
-                    <span className="font-mono text-xs text-stone-800 dark:text-stone-200 select-all font-medium">
-                      {vf.contentOrUrl}
-                    </span>
-                    <button
-                      onClick={() => {
-                        navigator.clipboard.writeText(vf.contentOrUrl);
-                        alert('Copied to clipboard');
-                      }}
-                      className="text-xs text-indigo-600 dark:text-indigo-400 font-semibold px-2 py-1 rounded hover:bg-indigo-50 dark:hover:bg-zinc-700"
-                    >
-                      Copy
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ----------------- MODALS ----------------- */}
-
-      {/* Add Vault File Modal */}
-      {showAddVault && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in">
-          <div className="w-full max-w-md bg-white dark:bg-zinc-900 rounded-3xl p-6 border border-stone-200 dark:border-zinc-800 shadow-2xl space-y-4">
-            <h3 className="text-sm font-bold text-stone-900 dark:text-stone-100">
-              Add Secure Family Vault Item
-            </h3>
-            <form onSubmit={handleCreateVault} className="space-y-3">
-              <div>
-                <label className="block text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1">Item Title</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. Spare House Key Location, WiFi Password"
-                  value={vaultTitle}
-                  onChange={e => setVaultTitle(e.target.value)}
-                  className="w-full px-3 py-2 text-xs rounded-xl border border-stone-200 dark:border-zinc-700 bg-stone-50 dark:bg-zinc-800 text-stone-900 dark:text-stone-100"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1">Category</label>
-                <select
-                  value={vaultCategory}
-                  onChange={e => setVaultCategory(e.target.value as any)}
-                  className="w-full px-3 py-2 text-xs rounded-xl border border-stone-200 dark:border-zinc-700 bg-stone-50 dark:bg-zinc-800 text-stone-900 dark:text-stone-100"
-                >
-                  <option value="home">Home & Keys</option>
-                  <option value="documents">Documents & IDs</option>
-                  <option value="health">Medical & Health</option>
-                  <option value="recipes">Secret Recipes</option>
-                  <option value="other">Other</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1">Content, Code or Location</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. Spare key is under flowerpot near back porch"
-                  value={vaultContent}
-                  onChange={e => setVaultContent(e.target.value)}
-                  className="w-full px-3 py-2 text-xs rounded-xl border border-stone-200 dark:border-zinc-700 bg-stone-50 dark:bg-zinc-800 text-stone-900 dark:text-stone-100"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-semibold text-stone-700 dark:text-stone-300 mb-1">Optional Note</label>
-                <textarea
-                  rows={2}
-                  placeholder="Any details or guidance..."
-                  value={vaultDesc}
-                  onChange={e => setVaultDesc(e.target.value)}
-                  className="w-full px-3 py-2 text-xs rounded-xl border border-stone-200 dark:border-zinc-700 bg-stone-50 dark:bg-zinc-800 text-stone-900 dark:text-stone-100"
-                />
-              </div>
-              <div className="flex items-center justify-end space-x-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowAddVault(false)}
-                  className="px-3 py-2 text-xs text-stone-500 hover:text-stone-700 dark:hover:text-stone-300"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-sm"
-                >
-                  Save to Vault
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+        <VaultView
+          homeId={activeHome.id}
+          homeMembers={members}
+          currentUserId={user?.id || ''}
+          userRole={userRole}
+        />
       )}
     </div>
   );

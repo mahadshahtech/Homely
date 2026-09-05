@@ -7,10 +7,14 @@ import {
   ArrowLeft,
   ChevronDown,
   ShieldCheck,
-  MessageSquare
+  MessageSquare,
+  Radio,
+  Wifi,
+  WifiOff
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../services/api';
+import { realtimeChat, type RealtimeStatus } from '../../services/realtimeChat';
 import type { Conversation, Message, HomeMember, MessagePoll, MessageLocation } from '../../types';
 import { ConversationSidebar } from './ConversationSidebar';
 import { MessageItem } from './MessageItem';
@@ -27,6 +31,7 @@ export const ChatView: React.FC = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
   const [members, setMembers] = useState<HomeMember[]>([]);
+  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>('disconnected');
 
   // UI Modals & Panels
   const [showNewDirectModal, setShowNewDirectModal] = useState(false);
@@ -91,26 +96,221 @@ export const ChatView: React.FC = () => {
     loadConversations();
   }, [activeHome?.id]);
 
+  // Connect to realtime WebSocket
+  useEffect(() => {
+    realtimeChat.connect();
+    const unsubStatus = realtimeChat.onStatusChange(setRealtimeStatus);
+
+    return () => {
+      unsubStatus();
+    };
+  }, []);
+
+  // Subscribe to active home room
+  useEffect(() => {
+    if (activeHome?.id) {
+      realtimeChat.joinHome(activeHome.id);
+    }
+  }, [activeHome?.id]);
+
   // When selected conversation changes
   useEffect(() => {
-    if (selectedConvId) {
+    if (selectedConvId && activeHome?.id) {
       loadMessages(selectedConvId);
       loadPinnedMessages(selectedConvId);
       setReplyingTo(null);
       setEditingMessage(null);
+      setTypingUsers([]);
       setMobileShowChat(true);
+
+      // Join realtime conversation room
+      realtimeChat.joinConversation(activeHome.id, selectedConvId);
+
+      return () => {
+        realtimeChat.leaveConversation(selectedConvId);
+      };
     }
   }, [selectedConvId, activeHome?.id]);
 
-  // Polling interval (every 3 seconds) for live chat updates & presence
+  // Realtime Event Listeners
+  useEffect(() => {
+    // 1. New incoming message delivered in real time
+    const unsubNewMsg = realtimeChat.on('message:new', (data: { conversationId: string; message: Message }) => {
+      const { conversationId, message } = data;
+
+      if (conversationId === selectedConvId) {
+        setMessages(prev => {
+          if (prev.some(m => m.id === message.id)) return prev;
+          return [...prev, { ...message, isOwn: message.sender?.id === user?.id }];
+        });
+        if (message.isPinned) {
+          setPinnedMessages(prev => (prev.some(m => m.id === message.id) ? prev : [message, ...prev]));
+        }
+      }
+
+      // Update sidebar preview and unread count
+      setConversations(prev =>
+        prev.map(c => {
+          if (c.id === conversationId) {
+            return {
+              ...c,
+              lastMessage: {
+                id: message.id,
+                content: message.content,
+                senderId: message.sender?.id || '',
+                senderName: message.sender?.name,
+                mediaType: message.mediaType,
+                createdAt: message.createdAt
+              },
+              unreadCount: c.id === selectedConvId ? 0 : (c.unreadCount + 1),
+              updatedAt: message.createdAt
+            };
+          }
+          return c;
+        })
+      );
+    });
+
+    // 2. Message edited
+    const unsubEdit = realtimeChat.on('message:edited', (data: { conversationId: string; messageId: string; content: string; isEdited: boolean; editedAt: string }) => {
+      if (data.conversationId === selectedConvId) {
+        setMessages(prev =>
+          prev.map(m => (m.id === data.messageId ? { ...m, content: data.content, isEdited: true, editedAt: data.editedAt } : m))
+        );
+      }
+      setConversations(prev =>
+        prev.map(c => {
+          if (c.id === data.conversationId && c.lastMessage?.id === data.messageId) {
+            return { ...c, lastMessage: { ...c.lastMessage, content: data.content } };
+          }
+          return c;
+        })
+      );
+    });
+
+    // 3. Message deleted
+    const unsubDelete = realtimeChat.on('message:deleted', (data: { conversationId: string; messageId: string }) => {
+      if (data.conversationId === selectedConvId) {
+        setMessages(prev => prev.filter(m => m.id !== data.messageId));
+        setPinnedMessages(prev => prev.filter(m => m.id !== data.messageId));
+      }
+    });
+
+    // 4. Reactions
+    const unsubReact = realtimeChat.on('message:reaction', (data: { conversationId: string; messageId: string; reactions: any[] }) => {
+      if (data.conversationId === selectedConvId) {
+        setMessages(prev =>
+          prev.map(m => (m.id === data.messageId ? { ...m, reactions: data.reactions } : m))
+        );
+      }
+    });
+
+    // 5. Pin status
+    const unsubPin = realtimeChat.on('message:pin', (data: { conversationId: string; messageId: string; isPinned: boolean; pinnedAt?: string; pinnedBy?: string }) => {
+      if (data.conversationId === selectedConvId) {
+        setMessages(prev =>
+          prev.map(m => (m.id === data.messageId ? { ...m, isPinned: data.isPinned, pinnedAt: data.pinnedAt, pinnedBy: data.pinnedBy } : m))
+        );
+        if (selectedConvId) loadPinnedMessages(selectedConvId);
+      }
+    });
+
+    // 6. Poll vote
+    const unsubPoll = realtimeChat.on('message:poll_vote', (data: { conversationId: string; messageId: string; poll: MessagePoll }) => {
+      if (data.conversationId === selectedConvId) {
+        setMessages(prev =>
+          prev.map(m => (m.id === data.messageId ? { ...m, poll: data.poll } : m))
+        );
+      }
+    });
+
+    // 7. Instant typing indicators
+    const unsubTyping = realtimeChat.on('typing:update', (data: { conversationId: string; userId: string; userName: string; isTyping: boolean }) => {
+      if (data.conversationId === selectedConvId) {
+        setTypingUsers(prev => {
+          if (data.isTyping) {
+            return prev.includes(data.userName) ? prev : [...prev, data.userName];
+          } else {
+            return prev.filter(name => name !== data.userName);
+          }
+        });
+      }
+    });
+
+    // 8. Presence updates
+    const unsubPresence = realtimeChat.on('presence:update', (data: { userId: string; isOnline: boolean; lastActiveAt?: string }) => {
+      setConversations(prev =>
+        prev.map(c => {
+          if (c.type === 'direct' && c.participants.some(p => p.id === data.userId)) {
+            return {
+              ...c,
+              isOnline: data.isOnline,
+              lastActiveAt: data.lastActiveAt || c.lastActiveAt,
+              participants: c.participants.map(p => (p.id === data.userId ? { ...p, isOnline: data.isOnline } : p))
+            };
+          }
+          return c;
+        })
+      );
+    });
+
+    // 9. Read receipts
+    const unsubRead = realtimeChat.on('conversation:read', (data: { conversationId: string; userId: string; readAt: string }) => {
+      if (data.conversationId === selectedConvId) {
+        setMessages(prev => prev.map(m => (m.isOwn ? { ...m, status: 'read' } : m)));
+      }
+    });
+
+    // 10. Conversation created
+    const unsubCreated = realtimeChat.on('conversation:created', (data: { conversation: Conversation }) => {
+      if (data.conversation.homeId === activeHome?.id) {
+        setConversations(prev => (prev.some(c => c.id === data.conversation.id) ? prev : [data.conversation, ...prev]));
+      }
+    });
+
+    // 11. Conversation updated
+    const unsubConvUpdate = realtimeChat.on('conversation:updated', (data: { conversationId: string; lastMessage: any; updatedAt: string }) => {
+      setConversations(prev =>
+        prev.map(c => {
+          if (c.id === data.conversationId) {
+            return {
+              ...c,
+              lastMessage: data.lastMessage,
+              updatedAt: data.updatedAt
+            };
+          }
+          return c;
+        })
+      );
+    });
+
+    return () => {
+      unsubNewMsg();
+      unsubEdit();
+      unsubDelete();
+      unsubReact();
+      unsubPin();
+      unsubPoll();
+      unsubTyping();
+      unsubPresence();
+      unsubRead();
+      unsubCreated();
+      unsubConvUpdate();
+    };
+  }, [selectedConvId, activeHome?.id, user?.id]);
+
+  // Secondary/fallback consistency interval (every 30s when online, 5s when reconnecting)
   useEffect(() => {
     if (!selectedConvId || !activeHome) return;
+    const intervalMs = realtimeStatus === 'connected' ? 30000 : 5000;
     const timer = setInterval(() => {
-      loadMessages(selectedConvId);
       loadConversations();
-    }, 3000);
+      if (realtimeStatus !== 'connected') {
+        loadMessages(selectedConvId);
+      }
+    }, intervalMs);
     return () => clearInterval(timer);
-  }, [selectedConvId, activeHome?.id]);
+  }, [selectedConvId, activeHome?.id, realtimeStatus]);
 
   // Auto-scroll on new messages unless user scrolled up
   useEffect(() => {
@@ -172,8 +372,29 @@ export const ChatView: React.FC = () => {
 
     try {
       const res = await api.sendMessage(activeHome.id, selectedConvId, payload);
-      setMessages(prev => [...prev, res.message]);
-      loadConversations();
+      setMessages(prev => {
+        if (prev.some(m => m.id === res.message.id)) return prev;
+        return [...prev, res.message];
+      });
+      setConversations(prev =>
+        prev.map(c => {
+          if (c.id === selectedConvId) {
+            return {
+              ...c,
+              lastMessage: {
+                id: res.message.id,
+                content: res.message.content,
+                senderId: res.message.sender?.id || user?.id || '',
+                senderName: user?.name,
+                mediaType: res.message.mediaType,
+                createdAt: res.message.createdAt
+              },
+              updatedAt: res.message.createdAt
+            };
+          }
+          return c;
+        })
+      );
       if (payload.isPinned) {
         loadPinnedMessages(selectedConvId);
       }
@@ -281,15 +502,11 @@ export const ChatView: React.FC = () => {
     });
   };
 
-  // Typing heartbeat
-  const handleTyping = async (isTyping: boolean) => {
+  // Typing state via WebSocket and fallback heartbeat
+  const handleTyping = (isTyping: boolean) => {
     if (!activeHome || !selectedConvId) return;
-    try {
-      const res = await api.sendHeartbeat(activeHome.id, selectedConvId, isTyping);
-      setTypingUsers(res.typingUsers || []);
-    } catch {
-      // ignore
-    }
+    realtimeChat.sendTyping(selectedConvId, isTyping);
+    api.sendHeartbeat(activeHome.id, selectedConvId, isTyping).catch(() => {});
   };
 
   // Jump to specific message
@@ -444,7 +661,27 @@ export const ChatView: React.FC = () => {
                 </div>
 
                 {/* Right Action Icons */}
-                <div className="flex items-center space-x-1 shrink-0">
+                <div className="flex items-center space-x-1.5 shrink-0">
+                  {/* Realtime Live Indicator Badge */}
+                  <div
+                    id="realtime-status-badge"
+                    className="flex items-center space-x-1.5 px-2 py-1 rounded-full text-[10px] font-semibold bg-stone-100 dark:bg-zinc-800 text-stone-600 dark:text-stone-300"
+                    title={`Realtime WebSocket: ${realtimeStatus}`}
+                  >
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        realtimeStatus === 'connected'
+                          ? 'bg-emerald-500 shadow-xs shadow-emerald-500/50 animate-pulse'
+                          : realtimeStatus === 'reconnecting' || realtimeStatus === 'connecting'
+                          ? 'bg-amber-500 animate-ping'
+                          : 'bg-stone-400'
+                      }`}
+                    />
+                    <span className="hidden sm:inline">
+                      {realtimeStatus === 'connected' ? 'Live' : realtimeStatus === 'reconnecting' ? 'Reconnecting' : realtimeStatus === 'connecting' ? 'Connecting' : 'Offline'}
+                    </span>
+                  </div>
+
                   {/* Pinned Messages Button */}
                   <button
                     type="button"

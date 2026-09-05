@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { SyncProvider } from './context/SyncContext';
 import { TopBar } from './components/Navigation/TopBar';
 import { BottomNav } from './components/Navigation/BottomNav';
+import { ConnectionStatusBanner } from './components/Navigation/ConnectionStatusBanner';
 import { AuthView } from './components/Auth/AuthView';
 import { CreateOrJoinHomeModal } from './components/HomeManagement/CreateOrJoinHomeModal';
 import { HomeSettingsModal } from './components/HomeManagement/HomeSettingsModal';
@@ -63,6 +65,9 @@ const MainLayout: React.FC = () => {
         onOpenCreateJoinModal={() => setIsCreateJoinModalOpen(true)}
         onOpenHomeSettings={() => setIsHomeSettingsOpen(true)}
       />
+
+      {/* Unobtrusive Connection & Sync Banner */}
+      <ConnectionStatusBanner />
 
       {/* Main Content Area */}
       <main className="flex-1 w-full max-w-md md:max-w-3xl mx-auto">
@@ -132,7 +137,9 @@ const MainLayout: React.FC = () => {
 export default function App() {
   return (
     <AuthProvider>
-      <MainLayout />
+      <SyncProvider>
+        <MainLayout />
+      </SyncProvider>
     </AuthProvider>
   );
 }
