@@ -64,9 +64,13 @@ export async function ensureDbReady(): Promise<void> {
 
 async function initDatabase(): Promise<void> {
   try {
-    await sqliteClient.execute('PRAGMA journal_mode = WAL;');
-    await sqliteClient.execute('PRAGMA synchronous = NORMAL;');
-    await sqliteClient.execute('PRAGMA foreign_keys = ON;');
+    // These PRAGMAs are only needed for the local SQLite database.
+    // Turso/libSQL handles its remote database differently.
+    if (!TURSO_DATABASE_URL) {
+      await sqliteClient.execute('PRAGMA journal_mode = WAL;');
+      await sqliteClient.execute('PRAGMA synchronous = NORMAL;');
+      await sqliteClient.execute('PRAGMA foreign_keys = ON;');
+    }
 
     // 1. Users
     await sqliteClient.execute(`
