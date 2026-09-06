@@ -39,9 +39,19 @@ if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-export const sqliteClient: Client = createClient({
-  url: `file:${DB_FILE}`
-});
+const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL;
+const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN;
+
+export const sqliteClient: Client = createClient(
+  TURSO_DATABASE_URL
+    ? {
+        url: TURSO_DATABASE_URL,
+        authToken: TURSO_AUTH_TOKEN,
+      }
+    : {
+        url: `file:${DB_FILE}`,
+      }
+);
 
 let dbReadyPromise: Promise<void> | null = null;
 
