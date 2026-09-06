@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { SyncProvider } from './context/SyncContext';
 import { TopBar } from './components/Navigation/TopBar';
@@ -16,20 +16,229 @@ import { NotificationsDrawer } from './components/Notifications/NotificationsDra
 import type { ActiveTab } from './types';
 import { Heart, Sparkles } from 'lucide-react';
 
+interface ParsedDeepLink {
+  hasDeepLink: boolean;
+  tab?: ActiveTab;
+  familySubTab?: 'members' | 'events' | 'memories' | 'vault';
+  conversationId?: string | null;
+  homeId?: string | null;
+}
+
+function parseDeepLink(searchStr: string): ParsedDeepLink {
+  if (!searchStr || searchStr.length <= 1) {
+    return { hasDeepLink: false };
+  }
+
+  try {
+    const params = new URLSearchParams(searchStr);
+    const rawTab = params.get('tab')?.toLowerCase()?.trim() || null;
+    const conv = params.get('conv') || params.get('conversation') || params.get('conversationId') || null;
+    const post = params.get('post') || params.get('postId') || null;
+    const event = params.get('event') || params.get('eventId') || null;
+    const memory = params.get('memory') || params.get('memoryId') || null;
+    const homeId = params.get('home') || params.get('homeId') || null;
+    const subTab = params.get('subtab') || params.get('subTab')?.toLowerCase()?.trim() || null;
+
+    // Chat destination: ?tab=chat&conv=... or ?tab=messages or ?conv=...
+    if (rawTab === 'chat' || rawTab === 'messages' || rawTab === 'message' || (!rawTab && conv)) {
+      return {
+        hasDeepLink: true,
+        tab: 'chat',
+        conversationId: conv,
+        homeId
+      };
+    }
+
+    // Feed / Home destination: ?tab=feed or ?tab=home or ?post=...
+    if (rawTab === 'feed' || rawTab === 'home' || rawTab === 'posts' || (!rawTab && post)) {
+      return {
+        hasDeepLink: true,
+        tab: 'home',
+        homeId
+      };
+    }
+
+    // Calendar / Events destination: ?tab=calendar or ?tab=events or ?event=...
+    if (rawTab === 'calendar' || rawTab === 'events' || rawTab === 'event' || (!rawTab && event)) {
+      return {
+        hasDeepLink: true,
+        tab: 'family',
+        familySubTab: 'events',
+        homeId
+      };
+    }
+
+    // Memories destination: ?tab=memories or ?tab=memory or ?memory=...
+    if (rawTab === 'memories' || rawTab === 'memory' || rawTab === 'photos' || (!rawTab && memory)) {
+      return {
+        hasDeepLink: true,
+        tab: 'family',
+        familySubTab: 'memories',
+        homeId
+      };
+    }
+
+    // Vault destination
+    if (rawTab === 'vault') {
+      return {
+        hasDeepLink: true,
+        tab: 'family',
+        familySubTab: 'vault',
+        homeId
+      };
+    }
+
+    // Members / Family destination
+    if (rawTab === 'members') {
+      return {
+        hasDeepLink: true,
+        tab: 'family',
+        familySubTab: 'members',
+        homeId
+      };
+    }
+
+    if (rawTab === 'family') {
+      let resolvedSubTab: 'members' | 'events' | 'memories' | 'vault' = 'members';
+      if (subTab === 'events' || subTab === 'calendar') resolvedSubTab = 'events';
+      else if (subTab === 'memories' || subTab === 'memory') resolvedSubTab = 'memories';
+      else if (subTab === 'vault') resolvedSubTab = 'vault';
+
+      return {
+        hasDeepLink: true,
+        tab: 'family',
+        familySubTab: resolvedSubTab,
+        homeId
+      };
+    }
+
+    // Ask Homely destination
+    if (rawTab === 'ask' || rawTab === 'ask_homely' || rawTab === 'assistant') {
+      return {
+        hasDeepLink: true,
+        tab: 'ask',
+        homeId
+      };
+    }
+
+    // Profile destination
+    if (rawTab === 'profile') {
+      return {
+        hasDeepLink: true,
+        tab: 'profile',
+        homeId
+      };
+    }
+
+    // If only homeId is passed without recognized tab
+    if (homeId) {
+      return {
+        hasDeepLink: true,
+        homeId
+      };
+    }
+
+    return { hasDeepLink: false };
+  } catch (err) {
+    console.warn('Failed to parse deep link query params:', err);
+    return { hasDeepLink: false };
+  }
+}
+
 const MainLayout: React.FC = () => {
-  const { user, loading, homes, activeHome } = useAuth();
+  const { user, loading, homes, activeHome, setActiveHomeId, chatUnreadCount } = useAuth();
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [familySubTab, setFamilySubTab] = useState<'members' | 'events' | 'memories' | 'vault'>('members');
+  const [targetConversationId, setTargetConversationId] = useState<string | null>(null);
   const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
   const [isCreateJoinModalOpen, setIsCreateJoinModalOpen] = useState(false);
   const [isHomeSettingsOpen, setIsHomeSettingsOpen] = useState(false);
+  const deepLinkHandledRef = useRef(false);
 
-  const handleNavigate = (tab: ActiveTab, subTab?: string) => {
+  const handleNavigate = (tab: ActiveTab, subTab?: string, targetId?: string) => {
     setActiveTab(tab);
     if (tab === 'family' && subTab) {
       setFamilySubTab(subTab as 'members' | 'events' | 'memories' | 'vault');
     }
+    if (tab === 'chat') {
+      setTargetConversationId(targetId || null);
+    } else {
+      setTargetConversationId(null);
+    }
   };
+
+  const applyDeepLink = useCallback(
+    (searchStr: string) => {
+      const parsed = parseDeepLink(searchStr);
+      if (!parsed.hasDeepLink) return false;
+
+      // 1. Home isolation: only switch if user belongs to that home
+      if (parsed.homeId && homes.length > 0) {
+        const authorizedHome = homes.find(h => h.id === parsed.homeId);
+        if (authorizedHome && activeHome?.id !== authorizedHome.id) {
+          setActiveHomeId(authorizedHome.id);
+        }
+      }
+
+      // 2. Tab navigation
+      if (parsed.tab) {
+        setActiveTab(parsed.tab);
+      }
+
+      // 3. Subtab navigation
+      if (parsed.familySubTab) {
+        setFamilySubTab(parsed.familySubTab);
+      }
+
+      // 4. Chat conversation targeting
+      if (parsed.tab === 'chat') {
+        setTargetConversationId(parsed.conversationId || null);
+      }
+
+      return true;
+    },
+    [homes, activeHome?.id, setActiveHomeId]
+  );
+
+  // Consume deep link once user is authenticated
+  useEffect(() => {
+    if (loading || !user) return;
+
+    if (!deepLinkHandledRef.current && window.location.search) {
+      const consumed = applyDeepLink(window.location.search);
+      if (consumed) {
+        deepLinkHandledRef.current = true;
+        // Clean query parameters so normal renders/reloads do not re-trigger it
+        try {
+          const cleanUrl = window.location.pathname + window.location.hash;
+          window.history.replaceState({}, document.title, cleanUrl);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }, [loading, user, applyDeepLink]);
+
+  // Listen for browser popstate or location changes (e.g. from service worker navigate)
+  useEffect(() => {
+    const handlePopState = () => {
+      if (loading || !user) return;
+      if (window.location.search) {
+        const consumed = applyDeepLink(window.location.search);
+        if (consumed) {
+          try {
+            const cleanUrl = window.location.pathname + window.location.hash;
+            window.history.replaceState({}, document.title, cleanUrl);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [loading, user, applyDeepLink]);
 
   if (loading) {
     return (
@@ -93,7 +302,7 @@ const MainLayout: React.FC = () => {
         ) : (
           <>
             {activeTab === 'home' && <HomeFeedView onNavigate={handleNavigate} />}
-            {activeTab === 'chat' && <ChatView />}
+            {activeTab === 'chat' && <ChatView initialConversationId={targetConversationId} />}
             {activeTab === 'ask' && <AskHomelyView />}
             {activeTab === 'family' && <FamilyView initialSubTab={familySubTab} />}
             {activeTab === 'profile' && (
@@ -107,7 +316,13 @@ const MainLayout: React.FC = () => {
       {!hasNoHome && (
         <BottomNav
           activeTab={activeTab}
-          onChangeTab={setActiveTab}
+          onChangeTab={tab => {
+            setActiveTab(tab);
+            if (tab !== 'chat') {
+              setTargetConversationId(null);
+            }
+          }}
+          chatUnreadCount={chatUnreadCount}
         />
       )}
 

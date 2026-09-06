@@ -24,8 +24,12 @@ import { LocationModal } from './LocationModal';
 import { PinnedMessagesModal } from './PinnedMessagesModal';
 import { ChatSearchModal } from './ChatSearchModal';
 
-export const ChatView: React.FC = () => {
-  const { activeHome, user } = useAuth();
+interface ChatViewProps {
+  initialConversationId?: string | null;
+}
+
+export const ChatView: React.FC<ChatViewProps> = ({ initialConversationId }) => {
+  const { activeHome, user, setCurrentViewingConvId, refreshUnreadCount } = useAuth();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selectedConvId, setSelectedConvId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -58,16 +62,38 @@ export const ChatView: React.FC = () => {
     if (!activeHome) return;
     try {
       const res = await api.getConversations(activeHome.id);
-      setConversations(res.conversations);
+      const list = res.conversations || [];
+      setConversations(list);
 
-      if (!selectedConvId && res.conversations.length > 0) {
-        const fam = res.conversations.find(c => c.type === 'family') || res.conversations[0];
-        setSelectedConvId(fam.id);
+      if (list.length > 0) {
+        // If initialConversationId is provided and valid for this home
+        const target = initialConversationId
+          ? list.find(c => c.id === initialConversationId)
+          : null;
+
+        if (target) {
+          setSelectedConvId(target.id);
+          setMobileShowChat(true);
+        } else if (!selectedConvId || !list.some(c => c.id === selectedConvId)) {
+          const fam = list.find(c => c.type === 'family') || list[0];
+          setSelectedConvId(fam.id);
+        }
       }
     } catch (err) {
       console.warn('Failed to load conversations:', err);
     }
   };
+
+  // Respond to deep-linked conversation ID updates
+  useEffect(() => {
+    if (initialConversationId && conversations.length > 0) {
+      const target = conversations.find(c => c.id === initialConversationId);
+      if (target) {
+        setSelectedConvId(target.id);
+        setMobileShowChat(true);
+      }
+    }
+  }, [initialConversationId, conversations]);
 
   // Fetch messages for active conversation
   const loadMessages = async (convId: string) => {
@@ -113,9 +139,20 @@ export const ChatView: React.FC = () => {
     }
   }, [activeHome?.id]);
 
+  // Track active viewing conversation in AuthContext for unread suppression
+  useEffect(() => {
+    setCurrentViewingConvId(selectedConvId);
+    return () => {
+      setCurrentViewingConvId(null);
+    };
+  }, [selectedConvId, setCurrentViewingConvId]);
+
   // When selected conversation changes
   useEffect(() => {
     if (selectedConvId && activeHome?.id) {
+      setConversations(prev =>
+        prev.map(c => (c.id === selectedConvId ? { ...c, unreadCount: 0 } : c))
+      );
       loadMessages(selectedConvId);
       loadPinnedMessages(selectedConvId);
       setReplyingTo(null);
@@ -152,6 +189,9 @@ export const ChatView: React.FC = () => {
       setConversations(prev =>
         prev.map(c => {
           if (c.id === conversationId) {
+            const isOwn = message.sender?.id === user?.id || (message as any)?.senderId === user?.id;
+            const isViewing = c.id === selectedConvId;
+            const newUnread = isViewing || isOwn ? 0 : ((c.unreadCount || 0) + 1);
             return {
               ...c,
               lastMessage: {
@@ -162,7 +202,7 @@ export const ChatView: React.FC = () => {
                 mediaType: message.mediaType,
                 createdAt: message.createdAt
               },
-              unreadCount: c.id === selectedConvId ? 0 : (c.unreadCount + 1),
+              unreadCount: newUnread,
               updatedAt: message.createdAt
             };
           }
@@ -194,6 +234,8 @@ export const ChatView: React.FC = () => {
         setMessages(prev => prev.filter(m => m.id !== data.messageId));
         setPinnedMessages(prev => prev.filter(m => m.id !== data.messageId));
       }
+      loadConversations();
+      refreshUnreadCount();
     });
 
     // 4. Reactions
@@ -273,15 +315,27 @@ export const ChatView: React.FC = () => {
       setConversations(prev =>
         prev.map(c => {
           if (c.id === data.conversationId) {
+            const isOwn = data.lastMessage?.senderId === user?.id;
+            const isViewing = c.id === selectedConvId;
+            const newUnread = isViewing || isOwn ? 0 : ((c.unreadCount || 0) + 1);
             return {
               ...c,
               lastMessage: data.lastMessage,
+              unreadCount: newUnread,
               updatedAt: data.updatedAt
             };
           }
           return c;
         })
       );
+    });
+
+    // 12. Reconnection handler: reconcile with backend after reconnect
+    const unsubReconnect = realtimeChat.on('reconnected', () => {
+      loadConversations();
+      if (selectedConvId) {
+        loadMessages(selectedConvId);
+      }
     });
 
     return () => {
@@ -296,6 +350,7 @@ export const ChatView: React.FC = () => {
       unsubRead();
       unsubCreated();
       unsubConvUpdate();
+      unsubReconnect();
     };
   }, [selectedConvId, activeHome?.id, user?.id]);
 

@@ -70,7 +70,6 @@ class SyncManager {
     const optimisticMessage: Message = {
       id: clientMessageId,
       conversationId,
-      senderId: userId,
       content: payload.content,
       replyToId: payload.replyToId,
       mediaUrl: payload.mediaUrl,
@@ -81,12 +80,11 @@ class SyncManager {
       extraData: typeof payload.extraData === 'object' ? JSON.stringify(payload.extraData) : payload.extraData,
       isPinned: payload.isPinned,
       createdAt: nowIso,
-      status: 'pending',
+      status: 'sent',
       isOwn: true,
       sender: {
         id: senderUser.id,
         name: senderUser.name,
-        email: senderUser.email,
         avatar: senderUser.avatar
       }
     };
@@ -137,8 +135,6 @@ class SyncManager {
 
     const optimisticPost: Post = {
       id: clientPostId,
-      homeId,
-      authorId: userId,
       content,
       type,
       imageUrl,
@@ -146,7 +142,6 @@ class SyncManager {
       author: {
         id: authorUser.id,
         name: authorUser.name,
-        email: authorUser.email,
         avatar: authorUser.avatar
       },
       comments: [],
@@ -368,6 +363,13 @@ class SyncManager {
         email: creatorUser.email,
         avatar: creatorUser.avatar
       },
+      attendees: [
+        {
+          id: creatorUser.id,
+          name: creatorUser.name,
+          avatar: creatorUser.avatar
+        }
+      ],
       rsvps: {
         going: [{ userId, name: creatorUser.name, avatar: creatorUser.avatar, status: 'going', updatedAt: nowIso }],
         maybe: [],

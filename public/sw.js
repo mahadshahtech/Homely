@@ -199,27 +199,97 @@ self.addEventListener('notificationclick', (event) => {
   );
 });
 
+// Helper to persist pending subscription renewal into IndexedDB without exposing sensitive credentials
+function savePendingRenewal(payload) {
+  return new Promise((resolve) => {
+    try {
+      if (!self.indexedDB) return resolve(false);
+      const req = self.indexedDB.open('homely_push_db', 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('pending_renewals')) {
+          db.createObjectStore('pending_renewals');
+        }
+      };
+      req.onsuccess = (e) => {
+        const db = e.target.result;
+        try {
+          if (!db.objectStoreNames.contains('pending_renewals')) {
+            db.close();
+            return resolve(false);
+          }
+          const tx = db.transaction('pending_renewals', 'readwrite');
+          const store = tx.objectStore('pending_renewals');
+          store.put(payload, 'latest_renewal');
+          tx.oncomplete = () => {
+            db.close();
+            resolve(true);
+          };
+          tx.onerror = () => {
+            db.close();
+            resolve(false);
+          };
+        } catch {
+          db.close();
+          resolve(false);
+        }
+      };
+      req.onerror = () => resolve(false);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
 // Handle subscription changes triggered by browser / push service
 self.addEventListener('pushsubscriptionchange', (event) => {
   event.waitUntil(
-    self.registration.pushManager.subscribe(event.oldSubscription.options)
-      .then((newSubscription) => {
-        // Post back to API if client is available or sync
-        return fetch('/api/push/subscribe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            endpoint: newSubscription.endpoint,
-            keys: {
-              p256dh: newSubscription.toJSON().keys?.p256dh,
-              auth: newSubscription.toJSON().keys?.auth
-            },
-            deviceLabel: 'Updated Browser Device'
-          })
-        });
-      })
-      .catch((err) => {
+    (async () => {
+      try {
+        let newSub = event.newSubscription;
+
+        // If the browser did not provide newSubscription, attempt to subscribe using existing options
+        if (!newSub) {
+          const options = (event.oldSubscription && event.oldSubscription.options)
+            ? event.oldSubscription.options
+            : undefined;
+
+          if (options) {
+            newSub = await self.registration.pushManager.subscribe(options);
+          } else {
+            newSub = await self.registration.pushManager.getSubscription();
+          }
+        }
+
+        if (!newSub) {
+          console.warn('[SW] pushsubscriptionchange: Unable to obtain new push subscription');
+          return;
+        }
+
+        const subJson = newSub.toJSON ? newSub.toJSON() : {};
+        const renewalPayload = {
+          endpoint: newSub.endpoint,
+          keys: {
+            p256dh: subJson.keys?.p256dh || '',
+            auth: subJson.keys?.auth || ''
+          },
+          updatedAt: Date.now()
+        };
+
+        // 1. Persist to IndexedDB so pending renewal survives even if all windows are closed
+        await savePendingRenewal(renewalPayload);
+
+        // 2. Notify any active window client(s) to immediately re-register with authenticated session
+        const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+        for (const client of clientList) {
+          client.postMessage({
+            type: 'HOMELY_PUSH_SUBSCRIPTION_CHANGE',
+            payload: renewalPayload
+          });
+        }
+      } catch (err) {
         console.warn('[SW] pushsubscriptionchange failed:', err);
-      })
+      }
+    })()
   );
 });

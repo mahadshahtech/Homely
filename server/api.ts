@@ -152,12 +152,30 @@ apiRouter.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', time: new Date().toISOString() });
 });
 
-// Static media uploads endpoint
+// Static media uploads endpoint with path traversal defense
 apiRouter.get('/uploads/:fileId', (req: Request, res: Response) => {
-  const safeFilename = path.basename(req.params.fileId);
-  const filePath = path.join(UPLOADS_DIR, safeFilename);
+  const rawFilename = req.params.fileId;
+  if (!rawFilename || typeof rawFilename !== 'string' || !/^[a-zA-Z0-9._-]+$/.test(rawFilename)) {
+    res.status(400).json({ error: 'Invalid file parameter' });
+    return;
+  }
 
-  if (!fs.existsSync(filePath)) {
+  const safeFilename = path.basename(rawFilename);
+  const filePath = path.resolve(UPLOADS_DIR, safeFilename);
+
+  // Strictly verify path stays within UPLOADS_DIR and is an existing file
+  if (!filePath.startsWith(UPLOADS_DIR + path.sep) || !fs.existsSync(filePath)) {
+    res.status(404).json({ error: 'File not found' });
+    return;
+  }
+
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      res.status(404).json({ error: 'File not found' });
+      return;
+    }
+  } catch {
     res.status(404).json({ error: 'File not found' });
     return;
   }
@@ -251,6 +269,40 @@ async function requireHomeAdmin(req: AuthRequest, res: Response, homeId: string)
     return false;
   }
   return true;
+}
+
+// Helper for conversation participant authorization with strict home isolation
+async function requireConversationParticipant(
+  req: AuthRequest,
+  res: Response,
+  homeId: string,
+  conversationId: string
+): Promise<Conversation | null> {
+  if (!(await requireHomeMembership(req, res, homeId))) return null;
+  const conversation = await getConversationById(conversationId);
+  if (!conversation || conversation.homeId !== homeId) {
+    res.status(404).json({ error: 'Conversation not found' });
+    return null;
+  }
+  if (!conversation.participantIds.includes(req.user!.id)) {
+    res.status(403).json({ error: 'Access denied to this conversation' });
+    return null;
+  }
+  return conversation;
+}
+
+// Helper to ensure a message belongs strictly to the requested conversation
+async function requireMessageInConversation(
+  res: Response,
+  messageId: string,
+  conversationId: string
+): Promise<Message | null> {
+  const message = await getMessageById(messageId);
+  if (!message || message.conversationId !== conversationId) {
+    res.status(404).json({ error: 'Message not found in this conversation' });
+    return null;
+  }
+  return message;
 }
 
 // -------------------------------------------------------------
@@ -810,7 +862,7 @@ apiRouter.post('/homes/:homeId/posts', requireAuth, async (req: AuthRequest, res
 
     if (clientPostId) {
       const existing = await getPostById(clientPostId);
-      if (existing) {
+      if (existing && existing.homeId === homeId && existing.authorId === req.user!.id) {
         res.status(200).json({
           post: {
             ...existing,
@@ -884,26 +936,29 @@ apiRouter.post(['/homes/:homeId/posts/:postId/reactions', '/homes/:homeId/posts/
       return;
     }
 
+    const post = await getPostById(postId);
+    if (!post || post.homeId !== homeId) {
+      res.status(404).json({ error: 'Post not found' });
+      return;
+    }
+
     const result = await toggleReaction(postId, req.user!.id, emoji);
 
     // Notify post author when a reaction is added
-    if (result.added) {
-      const post = await getPostById(postId);
-      if (post && post.authorId !== req.user!.id) {
-        await createNotification({
-          id: `n_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
-          homeId,
-          recipientId: post.authorId,
-          senderId: req.user!.id,
-          type: 'post_reaction',
-          title: `${req.user!.name} reacted ${emoji} to your post`,
-          body: post.content.slice(0, 80),
-          targetType: 'post',
-          targetId: postId,
-          read: false,
-          createdAt: new Date().toISOString()
-        });
-      }
+    if (result.added && post.authorId !== req.user!.id) {
+      await createNotification({
+        id: `n_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        homeId,
+        recipientId: post.authorId,
+        senderId: req.user!.id,
+        type: 'post_reaction',
+        title: `${req.user!.name} reacted ${emoji} to your post`,
+        body: post.content.slice(0, 80),
+        targetType: 'post',
+        targetId: postId,
+        read: false,
+        createdAt: new Date().toISOString()
+      });
     }
 
     res.json({ success: true, added: result.added });
@@ -925,7 +980,7 @@ apiRouter.post('/homes/:homeId/posts/:postId/comments', requireAuth, async (req:
     }
 
     const post = await getPostById(postId);
-    if (!post) {
+    if (!post || post.homeId !== homeId) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -999,7 +1054,7 @@ apiRouter.delete('/homes/:homeId/posts/:postId', requireAuth, async (req: AuthRe
     if (!(await requireHomeMembership(req, res, homeId))) return;
 
     const post = await getPostById(postId);
-    if (!post) {
+    if (!post || post.homeId !== homeId) {
       res.status(404).json({ error: 'Post not found' });
       return;
     }
@@ -1085,7 +1140,9 @@ apiRouter.post('/homes/:homeId/conversations/direct', requireAuth, async (req: A
     }
 
     if (isNew) {
-      broadcastToHome(homeId, 'conversation:created', { conversation: directConv });
+      for (const pId of directConv.participantIds) {
+        sendToUser(pId, 'conversation:created', { conversation: directConv });
+      }
     }
 
     res.json({ conversation: directConv });
@@ -1098,18 +1155,8 @@ apiRouter.post('/homes/:homeId/conversations/direct', requireAuth, async (req: A
 apiRouter.get('/homes/:homeId/conversations/:conversationId/messages', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
-
-    const conversation = await getConversationById(conversationId);
-    if (!conversation) {
-      res.status(404).json({ error: 'Conversation not found' });
-      return;
-    }
-
-    if (!conversation.participantIds.includes(req.user!.id)) {
-      res.status(403).json({ error: 'Access denied to this conversation' });
-      return;
-    }
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
 
     const messages = await getMessages(conversationId, req.user!.id);
 
@@ -1125,6 +1172,30 @@ apiRouter.get('/homes/:homeId/conversations/:conversationId/messages', requireAu
       },
       req.user!.id
     );
+
+    if (conversation.type !== 'direct') {
+      broadcastToHome(
+        homeId,
+        'conversation:read',
+        {
+          conversationId,
+          userId: req.user!.id,
+          userName: req.user!.name,
+          readAt: new Date().toISOString()
+        }
+      );
+    } else {
+      for (const pId of conversation.participantIds) {
+        if (pId !== req.user!.id) {
+          sendToUser(pId, 'conversation:read', {
+            conversationId,
+            userId: req.user!.id,
+            userName: req.user!.name,
+            readAt: new Date().toISOString()
+          });
+        }
+      }
+    }
 
     res.json({ messages });
   } catch (err) {
@@ -1171,18 +1242,8 @@ apiRouter.post('/homes/:homeId/chat/upload', requireAuth, async (req: AuthReques
 apiRouter.post('/homes/:homeId/conversations/:conversationId/messages', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
-
-    const conversation = await getConversationById(conversationId);
-    if (!conversation) {
-      res.status(404).json({ error: 'Conversation not found' });
-      return;
-    }
-
-    if (!conversation.participantIds.includes(req.user!.id)) {
-      res.status(403).json({ error: 'Access denied to this conversation' });
-      return;
-    }
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
 
     const {
       content,
@@ -1200,11 +1261,11 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages', requireA
     // Idempotency check: if message with clientMessageId already exists, return it
     if (clientMessageId) {
       const existing = await getMessageById(clientMessageId);
-      if (existing) {
+      if (existing && existing.conversationId === conversationId && existing.senderId === req.user!.id) {
         res.status(200).json({
           message: {
             ...existing,
-            isOwn: existing.senderId === req.user!.id,
+            isOwn: true,
             sender: sanitizeUser(req.user!)
           }
         });
@@ -1339,19 +1400,36 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages', requireA
       }
     });
 
-    // Realtime conversation update broadcast to home for instant sidebar sync
-    broadcastToHome(homeId, 'conversation:updated', {
-      conversationId,
-      lastMessage: {
-        id: newMsg.id,
-        content: newMsg.content,
-        senderId: newMsg.senderId,
-        senderName: sanitizedSender.name,
-        mediaType: newMsg.mediaType,
-        createdAt: newMsg.createdAt
-      },
-      updatedAt: newMsg.createdAt
-    });
+    // Realtime conversation update broadcast: home room for family chats, direct participants for direct chats
+    if (conversation.type !== 'direct') {
+      broadcastToHome(homeId, 'conversation:updated', {
+        conversationId,
+        lastMessage: {
+          id: newMsg.id,
+          content: newMsg.content,
+          senderId: newMsg.senderId,
+          senderName: sanitizedSender.name,
+          mediaType: newMsg.mediaType,
+          createdAt: newMsg.createdAt
+        },
+        updatedAt: newMsg.createdAt
+      });
+    } else {
+      for (const pId of conversation.participantIds) {
+        sendToUser(pId, 'conversation:updated', {
+          conversationId,
+          lastMessage: {
+            id: newMsg.id,
+            content: newMsg.content,
+            senderId: newMsg.senderId,
+            senderName: sanitizedSender.name,
+            mediaType: newMsg.mediaType,
+            createdAt: newMsg.createdAt
+          },
+          updatedAt: newMsg.createdAt
+        });
+      }
+    }
 
     res.status(201).json({
       message: {
@@ -1374,7 +1452,16 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages', requireA
 apiRouter.patch('/homes/:homeId/conversations/:conversationId/messages/:messageId', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId, messageId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
+
+    const message = await requireMessageInConversation(res, messageId, conversationId);
+    if (!message) return;
+
+    if (message.senderId !== req.user!.id) {
+      res.status(403).json({ error: 'You are not authorized to edit this message' });
+      return;
+    }
 
     const { content } = req.body;
     if (!content || typeof content !== 'string' || content.trim().length === 0) {
@@ -1384,7 +1471,7 @@ apiRouter.patch('/homes/:homeId/conversations/:conversationId/messages/:messageI
 
     const updated = await updateMessage(messageId, req.user!.id, content.trim());
     if (!updated) {
-      res.status(403).json({ error: 'Message not found or you are not authorized to edit this message' });
+      res.status(403).json({ error: 'Failed to update message' });
       return;
     }
 
@@ -1410,19 +1497,45 @@ apiRouter.patch('/homes/:homeId/conversations/:conversationId/messages/:messageI
 apiRouter.delete('/homes/:homeId/conversations/:conversationId/messages/:messageId', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId, messageId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
 
-    const deleted = await deleteMessage(messageId, req.user!.id, homeId);
-    if (!deleted) {
-      res.status(403).json({ error: 'Message not found or you are not authorized to delete this message' });
+    const message = await requireMessageInConversation(res, messageId, conversationId);
+    if (!message) return;
+
+    const userRole = await getUserRoleInHome(req.user!.id, homeId);
+    const isOwnerOrAdmin = userRole === 'owner' || userRole === 'admin';
+    if (message.senderId !== req.user!.id && !isOwnerOrAdmin) {
+      res.status(403).json({ error: 'You are not authorized to delete this message' });
       return;
     }
 
-    // Broadcast message deletion to conversation
+    const deleted = await deleteMessage(messageId, req.user!.id, homeId);
+    if (!deleted) {
+      res.status(403).json({ error: 'Failed to delete message' });
+      return;
+    }
+
+    // Broadcast message deletion to conversation room
     broadcastToConversation(conversationId, 'message:deleted', {
       conversationId,
       messageId
     });
+
+    // Isolate direct conversations from leaking deletion events to home room
+    if (conversation.type !== 'direct') {
+      broadcastToHome(homeId, 'message:deleted', {
+        conversationId,
+        messageId
+      });
+    } else {
+      for (const pId of conversation.participantIds) {
+        sendToUser(pId, 'message:deleted', {
+          conversationId,
+          messageId
+        });
+      }
+    }
 
     res.json({ success: true, messageId });
   } catch (err) {
@@ -1434,7 +1547,11 @@ apiRouter.delete('/homes/:homeId/conversations/:conversationId/messages/:message
 apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId/reactions', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId, messageId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
+
+    const message = await requireMessageInConversation(res, messageId, conversationId);
+    if (!message) return;
 
     const { emoji } = req.body;
     if (!emoji || typeof emoji !== 'string') {
@@ -1461,7 +1578,11 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId
 apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId/pin', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId, messageId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
+
+    const message = await requireMessageInConversation(res, messageId, conversationId);
+    if (!message) return;
 
     const result = await togglePinMessage(messageId, homeId, req.user!.id);
     if (!result) {
@@ -1488,7 +1609,8 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/messages/:messageId
 apiRouter.get('/homes/:homeId/conversations/:conversationId/pinned', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
 
     const pinnedMessages = await getPinnedMessages(conversationId, req.user!.id);
     res.json({ pinnedMessages });
@@ -1501,7 +1623,8 @@ apiRouter.get('/homes/:homeId/conversations/:conversationId/pinned', requireAuth
 apiRouter.get('/homes/:homeId/conversations/:conversationId/search', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
 
     const q = typeof req.query.q === 'string' ? req.query.q : undefined;
     const date = typeof req.query.date === 'string' ? req.query.date : undefined;
@@ -1516,14 +1639,19 @@ apiRouter.get('/homes/:homeId/conversations/:conversationId/search', requireAuth
 
 apiRouter.post('/homes/:homeId/conversations/:conversationId/poll-vote', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
-    const { homeId, conversationId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
+    const { homeId, conversationId, messageId, optionId } = req.body;
+    const paramHomeId = req.params.homeId;
+    const paramConvId = req.params.conversationId;
+    const conversation = await requireConversationParticipant(req, res, paramHomeId, paramConvId);
+    if (!conversation) return;
 
-    const { messageId, optionId } = req.body;
     if (!messageId || !optionId) {
       res.status(400).json({ error: 'Message ID and Option ID are required' });
       return;
     }
+
+    const message = await requireMessageInConversation(res, messageId, paramConvId);
+    if (!message) return;
 
     const poll = await votePoll(messageId, req.user!.id, optionId);
     if (!poll) {
@@ -1532,8 +1660,8 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/poll-vote', require
     }
 
     // Broadcast poll update to conversation
-    broadcastToConversation(conversationId, 'message:poll_vote', {
-      conversationId,
+    broadcastToConversation(paramConvId, 'message:poll_vote', {
+      conversationId: paramConvId,
       messageId,
       poll
     });
@@ -1548,7 +1676,8 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/poll-vote', require
 apiRouter.post('/homes/:homeId/conversations/:conversationId/heartbeat', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const { homeId, conversationId } = req.params;
-    if (!(await requireHomeMembership(req, res, homeId))) return;
+    const conversation = await requireConversationParticipant(req, res, homeId, conversationId);
+    if (!conversation) return;
 
     const { isTyping } = req.body;
     const result = await updateUserHeartbeat(req.user!.id, conversationId, !!isTyping);
@@ -1569,7 +1698,7 @@ apiRouter.post('/homes/:homeId/conversations/:conversationId/heartbeat', require
     res.json(result);
   } catch (err) {
     console.error('Heartbeat error:', err);
-    res.status(500).json({ error: 'Failed to update presence' });
+    res.status(500).json({ error: 'Failed to update heartbeat' });
   }
 });
 
@@ -1632,7 +1761,7 @@ apiRouter.post('/homes/:homeId/events', requireAuth, async (req: AuthRequest, re
 
     if (clientEventId) {
       const existing = await getEventById(clientEventId, req.user!.id);
-      if (existing) {
+      if (existing && existing.homeId === homeId && existing.creatorId === req.user!.id) {
         res.status(200).json({ event: existing });
         return;
       }
@@ -2660,12 +2789,17 @@ apiRouter.get('/homes/:homeId/notifications', requireAuth, async (req: AuthReque
   }
 });
 
-// Fast unread counts (total and broken down by home)
+// Fast unread counts (total and broken down by home, plus chat unread count)
 apiRouter.get('/notifications/unread-count', requireAuth, async (req: AuthRequest, res: Response) => {
   try {
     const homeId = typeof req.query.homeId === 'string' && req.query.homeId ? req.query.homeId : undefined;
     const counts = await getUnreadNotificationCount(req.user!.id, homeId);
-    res.json(counts);
+    let chatUnread = 0;
+    if (homeId) {
+      const convs = await getConversationsForUser(homeId, req.user!.id);
+      chatUnread = convs.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
+    }
+    res.json({ ...counts, chatUnread });
   } catch (err) {
     console.error('Get unread count error:', err);
     res.status(500).json({ error: 'Failed to get unread count' });

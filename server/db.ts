@@ -1403,6 +1403,12 @@ export async function getMessages(conversationId: string, currentUserId: string)
               lastReadAt = excluded.lastReadAt`,
       args: [readId, conversationId, currentUserId, latestMsg.id as string, now]
     });
+
+    // Also mark any unread message notifications for this conversation as read
+    await sqliteClient.execute({
+      sql: 'UPDATE notifications SET read = 1 WHERE recipientId = ? AND targetType = ? AND targetId = ?',
+      args: [currentUserId, 'conversation', conversationId]
+    });
   }
 
   // 3. Fetch conversation type and other reads for delivery/seen status
@@ -1621,11 +1627,16 @@ export async function updateMessage(messageId: string, userId: string, newConten
 export async function deleteMessage(messageId: string, userId: string, homeId: string): Promise<boolean> {
   await ensureDbReady();
   const res = await sqliteClient.execute({
-    sql: 'SELECT * FROM messages WHERE id = ? LIMIT 1',
+    sql: `SELECT m.*, c.homeId as convHomeId
+          FROM messages m
+          JOIN conversations c ON c.id = m.conversationId
+          WHERE m.id = ? LIMIT 1`,
     args: [messageId]
   });
   if (res.rows.length === 0) return false;
   const msg = res.rows[0];
+  if (msg.convHomeId !== homeId) return false;
+
   const role = await getUserRoleInHome(userId, homeId);
   const isOwnerOrAdmin = role === 'owner' || role === 'admin';
   if (msg.senderId !== userId && !isOwnerOrAdmin) return false;
@@ -1691,11 +1702,15 @@ export async function getReactionsForMessage(messageId: string, currentUserId: s
 export async function togglePinMessage(messageId: string, homeId: string, userId: string) {
   await ensureDbReady();
   const res = await sqliteClient.execute({
-    sql: 'SELECT isPinned FROM messages WHERE id = ? LIMIT 1',
+    sql: `SELECT m.isPinned, c.homeId as convHomeId
+          FROM messages m
+          JOIN conversations c ON c.id = m.conversationId
+          WHERE m.id = ? LIMIT 1`,
     args: [messageId]
   });
   if (res.rows.length === 0) return null;
   const row = res.rows[0];
+  if (row.convHomeId !== homeId) return null;
 
   const currentlyPinned = Number(row.isPinned || 0) === 1;
   const newPinned = currentlyPinned ? 0 : 1;

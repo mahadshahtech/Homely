@@ -27,7 +27,7 @@ import { NotificationPreferencesModal } from './NotificationPreferencesModal';
 interface NotificationsDrawerProps {
   isOpen: boolean;
   onClose: () => void;
-  onNavigate?: (tab: ActiveTab, subTab?: string) => void;
+  onNavigate?: (tab: ActiveTab, subTab?: string, targetId?: string) => void;
 }
 
 export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({
@@ -142,7 +142,7 @@ export const NotificationsDrawer: React.FC<NotificationsDrawerProps> = ({
       const targetType = notif.targetType;
 
       if (targetType === 'conversation' || type.startsWith('message')) {
-        onNavigate('chat');
+        onNavigate('chat', undefined, notif.targetId);
       } else if (targetType === 'event' || type.startsWith('event')) {
         onNavigate('family', 'events');
       } else if (targetType === 'memory' || type.startsWith('memory')) {

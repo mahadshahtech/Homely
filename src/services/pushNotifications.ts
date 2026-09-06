@@ -1,5 +1,14 @@
-import { api } from './api';
+import { api, getStoredToken } from './api';
 import type { PushDeviceSubscription } from '../types';
+
+export interface PendingPushRenewal {
+  endpoint: string;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+  updatedAt: number;
+}
 
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
@@ -62,6 +71,8 @@ export async function registerServiceWorker(): Promise<ServiceWorkerRegistration
     const registration = await navigator.serviceWorker.register('/sw.js', {
       scope: '/'
     });
+    // Set up message listener for push subscription renewal & sync any pending renewal
+    initPushSubscriptionSync();
     return registration;
   } catch (err) {
     console.warn('[Push] Service worker registration error:', err);
@@ -197,4 +208,167 @@ export async function unsubscribeCurrentDevice(): Promise<{ success: boolean; er
     console.error('[Push] unsubscribeCurrentDevice error:', err);
     return { success: false, error: err.message };
   }
+}
+
+/**
+ * Retrieve pending push subscription renewal saved by the Service Worker when browser rotated credentials
+ */
+export function getPendingRenewal(): Promise<PendingPushRenewal | null> {
+  return new Promise((resolve) => {
+    try {
+      if (typeof window === 'undefined' || !('indexedDB' in window)) {
+        return resolve(null);
+      }
+      const req = window.indexedDB.open('homely_push_db', 1);
+      req.onupgradeneeded = (e: any) => {
+        const db = e.target.result as IDBDatabase;
+        if (!db.objectStoreNames.contains('pending_renewals')) {
+          db.createObjectStore('pending_renewals');
+        }
+      };
+      req.onsuccess = (e: any) => {
+        const db = e.target.result as IDBDatabase;
+        try {
+          if (!db.objectStoreNames.contains('pending_renewals')) {
+            db.close();
+            return resolve(null);
+          }
+          const tx = db.transaction('pending_renewals', 'readonly');
+          const store = tx.objectStore('pending_renewals');
+          const getReq = store.get('latest_renewal');
+          getReq.onsuccess = () => {
+            const result = getReq.result as PendingPushRenewal | undefined;
+            db.close();
+            resolve(result || null);
+          };
+          getReq.onerror = () => {
+            db.close();
+            resolve(null);
+          };
+        } catch {
+          db.close();
+          resolve(null);
+        }
+      };
+      req.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+/**
+ * Clear the processed pending push subscription renewal from IndexedDB
+ */
+export function clearPendingRenewal(): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      if (typeof window === 'undefined' || !('indexedDB' in window)) {
+        return resolve(false);
+      }
+      const req = window.indexedDB.open('homely_push_db', 1);
+      req.onupgradeneeded = (e: any) => {
+        const db = e.target.result as IDBDatabase;
+        if (!db.objectStoreNames.contains('pending_renewals')) {
+          db.createObjectStore('pending_renewals');
+        }
+      };
+      req.onsuccess = (e: any) => {
+        const db = e.target.result as IDBDatabase;
+        try {
+          if (!db.objectStoreNames.contains('pending_renewals')) {
+            db.close();
+            return resolve(false);
+          }
+          const tx = db.transaction('pending_renewals', 'readwrite');
+          const store = tx.objectStore('pending_renewals');
+          store.delete('latest_renewal');
+          tx.oncomplete = () => {
+            db.close();
+            resolve(true);
+          };
+          tx.onerror = () => {
+            db.close();
+            resolve(false);
+          };
+        } catch {
+          db.close();
+          resolve(false);
+        }
+      };
+      req.onerror = () => resolve(false);
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+/**
+ * Synchronize any pending push subscription renewal with the backend using the authenticated session
+ */
+export async function syncPendingSubscriptionRenewal(): Promise<boolean> {
+  const token = getStoredToken();
+  if (!token) return false;
+
+  try {
+    const pending = await getPendingRenewal();
+    if (pending && pending.endpoint && pending.keys?.p256dh && pending.keys?.auth) {
+      const { label, platform } = getDeviceDetails();
+      await api.registerPushDevice({
+        endpoint: pending.endpoint,
+        keys: {
+          p256dh: pending.keys.p256dh,
+          auth: pending.keys.auth
+        },
+        deviceLabel: label,
+        platform
+      });
+      await clearPendingRenewal();
+      console.log('[Push] Pending push subscription renewal successfully synced with server.');
+      return true;
+    }
+  } catch (err) {
+    console.warn('[Push] Error syncing pending subscription renewal:', err);
+  }
+  return false;
+}
+
+let isSyncInitialized = false;
+
+/**
+ * Initialize client listener for push subscription renewal messages from the Service Worker
+ */
+export function initPushSubscriptionSync(): void {
+  if (typeof window === 'undefined' || isSyncInitialized) return;
+  isSyncInitialized = true;
+
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', async (event) => {
+      if (event.data?.type === 'HOMELY_PUSH_SUBSCRIPTION_CHANGE' && event.data.payload) {
+        const payload = event.data.payload as PendingPushRenewal;
+        const token = getStoredToken();
+        if (token && payload.endpoint && payload.keys?.p256dh && payload.keys?.auth) {
+          try {
+            const { label, platform } = getDeviceDetails();
+            await api.registerPushDevice({
+              endpoint: payload.endpoint,
+              keys: {
+                p256dh: payload.keys.p256dh,
+                auth: payload.keys.auth
+              },
+              deviceLabel: label,
+              platform
+            });
+            await clearPendingRenewal();
+            console.log('[Push] Push subscription renewal successfully registered via active client window.');
+          } catch (err) {
+            console.warn('[Push] Failed to register push renewal from SW message:', err);
+          }
+        }
+      }
+    });
+  }
+
+  // Check and process any pending renewal in storage
+  syncPendingSubscriptionRenewal().catch(() => {});
 }

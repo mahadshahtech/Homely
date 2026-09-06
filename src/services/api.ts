@@ -655,7 +655,7 @@ export const api = {
 
   async getUnreadNotificationCount(homeId?: string) {
     const query = homeId ? `?homeId=${encodeURIComponent(homeId)}` : '';
-    return request<{ total: number; byHome: Record<string, number> }>(`/notifications/unread-count${query}`);
+    return request<{ total: number; byHome: Record<string, number>; chatUnread?: number }>(`/notifications/unread-count${query}`);
   },
 
   async markNotificationRead(id: string) {
